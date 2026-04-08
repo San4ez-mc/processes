@@ -348,8 +348,6 @@ bot.on('document', async (msg) => {
     }
 
     const normalized = extractedText.replace(/\s+/g, ' ').trim()
-    const preview = normalized.substring(0, 240)
-    await safeSendMessage(userId, `✅ Документ прочитано: ${fileName}\nФрагмент: ${preview}${normalized.length > 240 ? '...' : ''}`)
 
     const payload = `[з документа ${fileName}]\n${normalized.substring(0, 5000)}`
     await handleMessage(userId, payload)
