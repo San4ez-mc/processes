@@ -370,16 +370,40 @@ bot.on('error', (err) => {
 // ─── Допоміжні функції ────────────────────────────────────────────────────────
 
 async function safeSendMessage(userId, text) {
-  try {
-    await bot.sendMessage(userId, text, { parse_mode: 'Markdown' })
-  } catch (err) {
-    // Якщо Markdown не пройшов — надсилаємо без форматування
+  const chunks = splitMessageChunks(String(text || ''))
+  for (const chunk of chunks) {
     try {
-      await bot.sendMessage(userId, text)
-    } catch (err2) {
-      console.error('[bot] safeSendMessage error:', err2.message)
+      await bot.sendMessage(userId, chunk, { parse_mode: 'Markdown' })
+    } catch {
+      // Якщо Markdown не пройшов — надсилаємо без форматування
+      try {
+        await bot.sendMessage(userId, chunk)
+      } catch (err2) {
+        console.error('[bot] safeSendMessage error:', err2.message)
+      }
     }
   }
+}
+
+function splitMessageChunks(text, maxLen = 3500) {
+  if (!text) return ['']
+  if (text.length <= maxLen) return [text]
+
+  const parts = []
+  let current = text
+  while (current.length > maxLen) {
+    // Прагнемо різати по переносу рядка, щоб не ламати читабельність
+    let cut = current.lastIndexOf('\n', maxLen)
+    if (cut < 0 || cut < Math.floor(maxLen * 0.5)) {
+      cut = maxLen
+    }
+    parts.push(current.slice(0, cut).trim())
+    current = current.slice(cut).trim()
+  }
+  if (current.length > 0) {
+    parts.push(current)
+  }
+  return parts
 }
 
 async function launchScenario(userId, payload) {
