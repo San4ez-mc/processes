@@ -211,23 +211,16 @@ async function handleMessage(userId, text) {
 
   // Отправляємо фото і inline-кнопки
   try {
-    console.log(`[bot] User ${userId}: Sending photo with action buttons...`)
+    console.log(`[bot] User ${userId}: Sending final schema photo...`)
     await bot.sendPhoto(userId, pngBuffer, {
-      caption: '📋 Схема бізнес-процесу вашої компанії',
-      reply_markup: JSON.stringify({
-        inline_keyboard: [
-          [
-            { text: '➡️ Повернутись і редагувати', callback_data: 'action_restart' },
-            { text: '📑 Завантажити', callback_data: 'action_download' }
-          ]
-        ]
-      })
+      caption: '📋 Схема бізнес-процесу вашої компанії'
     })
   } catch (err) {
     console.error('[bot] sendPhoto error:', err.message)
     await safeSendMessage(userId, '📊 Схема отримана')
   }
-  await safeSendMessage(userId, COMPLETION_MESSAGE)
+
+  await sendCompletionActions(userId)
   console.log(`[bot] User ${userId}: ==================== INTERVIEW FULLY COMPLETE ====================`)
 }
 
@@ -289,8 +282,7 @@ bot.on('callback_query', async (query) => {
       const session = await db.getOrCreateSession(userId)
       if (session.mermaid_code && session.process_model?.mermaid_code) {
         await bot.answerCallbackQuery(query.id, { text: '📑 Готово...' })
-        await safeSendMessage(userId,
-          `📋 Мермайд код:\n\`\`\`\n${session.mermaid_code.substring(0, 2000)}\n\`\`\`\n\n[Вкопіюйте чи використайте на mermaid.live]`)
+        await sendProcessFiles(userId, session)
       } else {
         await bot.answerCallbackQuery(query.id, { text: '❌ Схема не готова', show_alert: true })
       }
@@ -387,6 +379,64 @@ async function safeSendMessage(userId, text) {
       }
     }
   }
+}
+
+async function sendCompletionActions(userId) {
+  const text = `${COMPLETION_MESSAGE}\n\nОберіть дію нижче:`
+  try {
+    await bot.sendMessage(userId, text, {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: 'Повернутись і відредагувати ще щось', callback_data: 'action_restart' },
+            { text: 'Отримати опис процесу', callback_data: 'action_download' },
+          ],
+        ],
+      },
+    })
+  } catch (err) {
+    console.error('[bot] sendCompletionActions markdown error:', err.message)
+    await bot.sendMessage(userId, text, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: 'Повернутись і відредагувати ще щось', callback_data: 'action_restart' },
+            { text: 'Отримати опис процесу', callback_data: 'action_download' },
+          ],
+        ],
+      },
+    })
+  }
+}
+
+async function sendProcessFiles(userId, session) {
+  // 1) PNG схема
+  let pngBuffer
+  try {
+    pngBuffer = await renderMermaid(session.mermaid_code)
+  } catch (err) {
+    console.error('[bot] Failed to render mermaid for download:', err.message)
+    await safeSendMessage(userId, 'Не вдалося підготувати PNG схеми. Спробуйте ще раз.')
+    return
+  }
+
+  await bot.sendDocument(
+    userId,
+    pngBuffer,
+    { caption: 'Файл 1/2: бізнес-процес (PNG)' },
+    { filename: 'business_process.png', contentType: 'image/png' }
+  )
+
+  // 2) JSON модель
+  const jsonString = JSON.stringify(session.process_model, null, 2)
+  const jsonBuffer = Buffer.from(jsonString, 'utf8')
+  await bot.sendDocument(
+    userId,
+    jsonBuffer,
+    { caption: 'Файл 2/2: модель процесу (JSON)' },
+    { filename: 'process_model.json', contentType: 'application/json' }
+  )
 }
 
 function splitMessageChunks(text, maxLen = 3500) {
