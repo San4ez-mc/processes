@@ -132,16 +132,33 @@ async function runMigration() {
 }
 
 /**
- * Перевірити доступність БД і гарантовано створити таблицю sessions
+ * Перевірити доступність БД і гарантовано створити таблицю sessions.
+ * Повторює спроби з'єднання (Railway запускає Postgres паралельно з app).
  */
-async function ensureReady() {
-  try {
-    await pool.query('SELECT 1')
-    await runMigration()
-    console.log('[db] Database is ready')
-  } catch (err) {
-    throw new Error(formatDbError(err))
+async function ensureReady({ retries = 8, delayMs = 4000 } = {}) {
+  // Логуємо masked URL для діагностики (без пароля)
+  const rawUrl = process.env.DATABASE_URL || ''
+  const masked = rawUrl
+    ? rawUrl.replace(/:[^:@]+@/, ':***@')
+    : '(DATABASE_URL not set!)'
+  console.log(`[db] Connecting to: ${masked}`)
+
+  let lastErr
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      await pool.query('SELECT 1')
+      await runMigration()
+      console.log('[db] Database is ready')
+      return
+    } catch (err) {
+      lastErr = err
+      console.warn(`[db] Attempt ${attempt}/${retries} failed: ${formatDbError(err)}`)
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, delayMs))
+      }
+    }
   }
+  throw new Error(formatDbError(lastErr))
 }
 
 function rowToSession(row) {

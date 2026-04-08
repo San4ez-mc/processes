@@ -244,13 +244,20 @@ console.log(`[bot] LLM Provider: ${config.llm.provider} | Model: ${config.llm.mo
 bootstrap()
 
 async function bootstrap() {
+  startHealthServer()
+  let dbReady = false
   try {
-    startHealthServer()
-    await db.ensureReady()
-    console.log('[bot] Bot is running. Press Ctrl+C to stop.')
+    await db.ensureReady({ retries: 10, delayMs: 5000 })
+    dbReady = true
   } catch (err) {
-    console.error('[bot] Startup failed (DB not ready):', db.formatDbError(err))
-    process.exit(1)
+    console.error('[bot] DB permanently unreachable after all retries:', db.formatDbError(err))
+    console.error('[bot] Check DATABASE_URL variable in Railway Variables tab!')
+    // НЕ падаємо — health server живий, але бот відповідатиме «технічна помилка»
+  }
+  if (dbReady) {
+    console.log('[bot] Bot is fully running. Press Ctrl+C to stop.')
+  } else {
+    console.log('[bot] Bot started WITHOUT DB — will respond with error to users.')
   }
 }
 
