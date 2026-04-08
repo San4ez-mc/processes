@@ -63,6 +63,7 @@ async function handleMessage(userId, text) {
   // ── Крок 1: виклик інтерв'ю-агента ──
   let agentResponse
   try {
+    await sendChatAction(userId, 'typing')
     agentResponse = await runInterviewStep(session)
   } catch (err) {
     console.error('[bot] Interview agent error:', err.message)
@@ -82,6 +83,7 @@ async function handleMessage(userId, text) {
   if (isDocumentInput) {
     console.log(`[bot] User ${userId}: Running completeness check for document input...`)
     try {
+      await sendChatAction(userId, 'typing')
       const completeness = await runValidator(session.process_model)
       const checklist = buildCompletenessChecklist(session.process_model)
       const done = checklist.filter((c) => c.ok).length
@@ -130,6 +132,7 @@ async function handleMessage(userId, text) {
   if (session.validation_attempts < MAX_VALIDATION_ATTEMPTS) {
     let validationResult
     try {
+      await sendChatAction(userId, 'typing')
       validationResult = await runValidator(session.process_model)
       console.log(`[bot] User ${userId}: Validator OK, valid=${validationResult?.valid}`)
     } catch (err) {
@@ -163,6 +166,7 @@ async function handleMessage(userId, text) {
   let mermaidCode
   try {
     console.log(`[bot] User ${userId}: Calling runMermaidGenerator...`)
+    await sendChatAction(userId, 'typing')
     mermaidCode = await runMermaidGenerator(session.process_model)
     console.log(`[bot] User ${userId}: Mermaid OK, code length=${mermaidCode?.length}`)
     session.process_model.mermaid_code = mermaidCode
@@ -184,6 +188,7 @@ async function handleMessage(userId, text) {
   let pngBuffer
   try {
     console.log(`[bot] User ${userId}: Calling renderMermaid...`)
+    await sendChatAction(userId, 'upload_document')
     pngBuffer = await renderMermaid(mermaidCode)
     console.log(`[bot] User ${userId}: PNG render OK, size=${pngBuffer?.length} bytes`)
   } catch (err) {
@@ -306,8 +311,10 @@ bot.on('voice', async (msg) => {
   console.log(`[bot] User ${userId}: Received voice message`)
 
   try {
+    await sendChatAction(userId, 'typing')
     await safeSendMessage(userId, '🎙 Розпізнаю голосове повідомлення...')
     const audioBuffer = await downloadTelegramFile(msg.voice.file_id)
+    await sendChatAction(userId, 'typing')
     const transcript = await transcribeAudio(audioBuffer, `voice_${msg.voice.file_unique_id || Date.now()}.ogg`)
 
     if (!transcript) {
@@ -339,6 +346,7 @@ bot.on('document', async (msg) => {
       return
     }
 
+    await sendChatAction(userId, 'typing')
     await safeSendMessage(userId, '📄 Читаю документ...')
     const fileBuffer = await downloadTelegramFile(fileId)
     console.log(`[bot] User ${userId}: Document meta: mime=${mimeType || 'n/a'}, size=${fileBuffer.length}`)
@@ -395,6 +403,14 @@ async function safeSendMessage(userId, text) {
   }
 }
 
+async function sendChatAction(userId, action = 'typing') {
+  try {
+    await bot.sendChatAction(userId, action)
+  } catch {
+    // Ignore chat action errors; they should not break message flow.
+  }
+}
+
 async function sendCompletionActions(userId) {
   const text = `${COMPLETION_MESSAGE}\n\nОберіть дію нижче:`
   try {
@@ -428,6 +444,7 @@ async function sendProcessFiles(userId, session) {
   // 1) PNG схема
   let pngBuffer
   try {
+    await sendChatAction(userId, 'upload_document')
     pngBuffer = await renderMermaid(session.mermaid_code)
   } catch (err) {
     console.error('[bot] Failed to render mermaid for download:', err.message)
@@ -435,6 +452,7 @@ async function sendProcessFiles(userId, session) {
     return
   }
 
+  await sendChatAction(userId, 'upload_document')
   await bot.sendDocument(
     userId,
     pngBuffer,
@@ -445,6 +463,7 @@ async function sendProcessFiles(userId, session) {
   // 2) JSON модель
   const jsonString = JSON.stringify(session.process_model, null, 2)
   const jsonBuffer = Buffer.from(jsonString, 'utf8')
+  await sendChatAction(userId, 'upload_document')
   await bot.sendDocument(
     userId,
     jsonBuffer,
