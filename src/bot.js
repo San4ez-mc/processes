@@ -82,6 +82,9 @@ async function handleMessage(userId, text) {
     console.log(`[bot] User ${userId}: Running completeness check for document input...`)
     try {
       const completeness = await runValidator(session.process_model)
+      const checklist = buildCompletenessChecklist(session.process_model)
+      await safeSendMessage(userId, formatChecklistMessage(checklist))
+
       if (completeness?.valid) {
         console.log(`[bot] User ${userId}: Document appears complete, moving to finalization.`)
         agentResponse.isComplete = true
@@ -468,6 +471,121 @@ function decodeTextBuffer(fileBuffer) {
   // Latin-1 fallback (для випадків не-UTF8 txt)
   text = fileBuffer.toString('latin1').replace(/\u0000/g, '')
   return text
+}
+
+function buildCompletenessChecklist(processModel) {
+  const lanes = Array.isArray(processModel?.lanes) ? processModel.lanes : []
+  const edges = Array.isArray(processModel?.edges) ? processModel.edges : []
+  const nodes = lanes.flatMap((lane) => Array.isArray(lane.nodes) ? lane.nodes : [])
+  const nodeById = new Map(nodes.map((n) => [n.id, n]))
+
+  const incoming = new Map()
+  const outgoing = new Map()
+  for (const n of nodes) {
+    incoming.set(n.id, 0)
+    outgoing.set(n.id, 0)
+  }
+
+  let edgesReferenceKnownNodesOnly = true
+  for (const e of edges) {
+    const from = e?.from
+    const to = e?.to
+    if (!nodeById.has(from) || !nodeById.has(to)) {
+      edgesReferenceKnownNodesOnly = false
+      continue
+    }
+    outgoing.set(from, (outgoing.get(from) || 0) + 1)
+    incoming.set(to, (incoming.get(to) || 0) + 1)
+  }
+
+  const startNodes = nodes.filter((n) => n.type === 'start')
+  const endNodes = nodes.filter((n) => n.type === 'end')
+  const hasExactlyOneStart = startNodes.length === 1
+  const hasAtLeastOneEnd = endNodes.length > 0
+
+  const allNonStartHaveIncoming = nodes
+    .filter((n) => n.type !== 'start')
+    .every((n) => (incoming.get(n.id) || 0) > 0)
+
+  const allNonEndHaveOutgoing = nodes
+    .filter((n) => n.type !== 'end')
+    .every((n) => (outgoing.get(n.id) || 0) > 0)
+
+  const danglingNodesCount = nodes.filter((n) => {
+    const inCount = incoming.get(n.id) || 0
+    const outCount = outgoing.get(n.id) || 0
+    return inCount === 0 && outCount === 0
+  }).length
+
+  const hasPathStartToEnd = checkPathFromStartToAnyEnd(startNodes, endNodes, edges, nodeById)
+
+  const textBag = [
+    ...lanes.map((l) => `${l.role || ''} ${l.responsible || ''}`),
+    ...nodes.map((n) => `${n.label || ''} ${n.description || ''}`),
+  ].join(' ').toLowerCase()
+
+  const hasAcquisitionBlock = /(лід|заявк|реклам|маркет|instagram|facebook|google ads|трафік|дзвінок)/.test(textBag)
+  const hasSalesBlock = /(продаж|кваліф|кп|комерційн|пропозиці|договір|згода)/.test(textBag)
+  const hasOperationsBlock = /(викон|вироб|надання послуг|послуга|проєкт|доставка|реалізац)/.test(textBag)
+  const hasPaymentBlock = /(оплат|рахунок|платіж|акт|invoice|каса|банківськ)/.test(textBag)
+
+  const hasFinanceLane = lanes.some((l) => {
+    const role = `${l.role || ''} ${l.responsible || ''}`.toLowerCase()
+    return /(фінанс|бухгалтер|облік|account|finance)/.test(role)
+  })
+
+  return [
+    { ok: hasExactlyOneStart, label: 'Є рівно один стартовий вузол' },
+    { ok: hasAtLeastOneEnd, label: 'Є хоча б один фінальний вузол' },
+    { ok: allNonStartHaveIncoming, label: 'Кожен вузол (крім start) має вхідні звʼязки' },
+    { ok: allNonEndHaveOutgoing, label: 'Кожен вузол (крім end) має вихідні звʼязки' },
+    { ok: edgesReferenceKnownNodesOnly, label: 'Усі ребра посилаються на існуючі вузли' },
+    { ok: hasPathStartToEnd, label: 'Є логічний шлях від start до end' },
+    { ok: danglingNodesCount === 0, label: 'Немає висячих вузлів без звʼязків' },
+    { ok: hasAcquisitionBlock, label: 'Є блок залучення клієнта' },
+    { ok: hasSalesBlock, label: 'Є блок продажу/кваліфікації' },
+    { ok: hasOperationsBlock, label: 'Є блок виконання/операцій' },
+    { ok: hasPaymentBlock, label: 'Є блок оплати і закриття' },
+    { ok: hasFinanceLane, label: 'Є фінансова роль (бухгалтер/фінанси)' },
+  ]
+}
+
+function checkPathFromStartToAnyEnd(startNodes, endNodes, edges, nodeById) {
+  if (!startNodes.length || !endNodes.length) return false
+
+  const endIds = new Set(endNodes.map((n) => n.id))
+  const adjacency = new Map()
+  for (const n of nodeById.values()) {
+    adjacency.set(n.id, [])
+  }
+
+  for (const e of edges) {
+    if (adjacency.has(e?.from) && adjacency.has(e?.to)) {
+      adjacency.get(e.from).push(e.to)
+    }
+  }
+
+  const queue = [startNodes[0].id]
+  const visited = new Set(queue)
+  while (queue.length > 0) {
+    const cur = queue.shift()
+    if (endIds.has(cur)) return true
+    const next = adjacency.get(cur) || []
+    for (const n of next) {
+      if (!visited.has(n)) {
+        visited.add(n)
+        queue.push(n)
+      }
+    }
+  }
+  return false
+}
+
+function formatChecklistMessage(checklist) {
+  const done = checklist.filter((c) => c.ok).length
+  const total = checklist.length
+  const lines = checklist.map((c) => `${c.ok ? '✅' : '❌'} ${c.label}`)
+  return `Чекліст повноти процесу (${done}/${total}):\n\n${lines.join('\n')}`
 }
 
 // ─── Запуск ───────────────────────────────────────────────────────────────────
