@@ -34,7 +34,7 @@ async function handleMessage(userId, text) {
   try {
     session = await db.getOrCreateSession(userId)
   } catch (err) {
-    console.error('[bot] DB getOrCreateSession error:', err.message)
+    console.error('[bot] DB getOrCreateSession error:', db.formatDbError(err))
     await safeSendMessage(userId, 'Виникла технічна помилка бази даних. Спробуйте /start ще раз.')
     return
   }
@@ -165,7 +165,7 @@ bot.onText(/\/start/, async (msg) => {
   try {
     await db.deleteSession(userId)
   } catch (err) {
-    console.error('[bot] deleteSession error:', err.message)
+    console.error('[bot] deleteSession error:', db.formatDbError(err))
   }
   await safeSendMessage(userId, START_MESSAGE)
 })
@@ -175,7 +175,7 @@ bot.onText(/\/restart/, async (msg) => {
   try {
     await db.deleteSession(userId)
   } catch (err) {
-    console.error('[bot] deleteSession error:', err.message)
+    console.error('[bot] deleteSession error:', db.formatDbError(err))
   }
   await safeSendMessage(userId, `Починаємо спочатку! 🔄\n\n${START_MESSAGE}`)
 })
@@ -238,4 +238,15 @@ async function safeSendMessage(userId, text) {
 
 console.log(`[bot] Starting business-process-agent...`)
 console.log(`[bot] LLM Provider: ${config.llm.provider} | Model: ${config.llm.model}`)
-console.log(`[bot] Bot is running. Press Ctrl+C to stop.`)
+
+bootstrap()
+
+async function bootstrap() {
+  try {
+    await db.ensureReady()
+    console.log('[bot] Bot is running. Press Ctrl+C to stop.')
+  } catch (err) {
+    console.error('[bot] Startup failed (DB not ready):', db.formatDbError(err))
+    process.exit(1)
+  }
+}

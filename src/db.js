@@ -13,8 +13,25 @@ const pool = new Pool({
 })
 
 pool.on('error', (err) => {
-  console.error('[db] Unexpected pool error:', err.message)
+  console.error('[db] Unexpected pool error:', formatDbError(err))
 })
+
+function formatDbError(err) {
+  if (!err) return 'Unknown DB error'
+  const parts = []
+  if (err.message) parts.push(err.message)
+  if (err.code) parts.push(`code=${err.code}`)
+  if (err.detail) parts.push(`detail=${err.detail}`)
+  if (err.hint) parts.push(`hint=${err.hint}`)
+  if (parts.length === 0) {
+    try {
+      return JSON.stringify(err)
+    } catch {
+      return String(err)
+    }
+  }
+  return parts.join(' | ')
+}
 
 /**
  * Початковий стан process_model для нової сесії
@@ -114,6 +131,19 @@ async function runMigration() {
   }
 }
 
+/**
+ * Перевірити доступність БД і гарантовано створити таблицю sessions
+ */
+async function ensureReady() {
+  try {
+    await pool.query('SELECT 1')
+    await runMigration()
+    console.log('[db] Database is ready')
+  } catch (err) {
+    throw new Error(formatDbError(err))
+  }
+}
+
 function rowToSession(row) {
   return {
     id: row.id,
@@ -128,4 +158,11 @@ function rowToSession(row) {
   }
 }
 
-module.exports = { getOrCreateSession, saveSession, deleteSession, runMigration }
+module.exports = {
+  getOrCreateSession,
+  saveSession,
+  deleteSession,
+  runMigration,
+  ensureReady,
+  formatDbError,
+}

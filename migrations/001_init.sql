@@ -1,6 +1,8 @@
 -- Міграція 001: Створення таблиці сесій
 -- Запуск: node -e "require('./src/db').runMigration()"
 
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 CREATE TABLE IF NOT EXISTS sessions (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   telegram_id         BIGINT UNIQUE NOT NULL,

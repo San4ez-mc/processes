@@ -18,6 +18,8 @@ if (provider === 'openai' && !process.env.OPENAI_API_KEY) {
   process.exit(1)
 }
 
+const dbSslEnabled = (process.env.DB_SSL || 'false').toLowerCase() === 'true'
+
 module.exports = {
   telegram: {
     token: process.env.TELEGRAM_BOT_TOKEN,
@@ -31,9 +33,7 @@ module.exports = {
   },
   db: {
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' && process.env.DB_SSL !== 'false'
-      ? { rejectUnauthorized: false }
-      : false,
+    ssl: dbSslEnabled ? { rejectUnauthorized: false } : false,
   },
   mermaid: {
     width: 1200,
