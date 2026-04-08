@@ -9,10 +9,29 @@ const { INTERVIEW_PROMPT, VALIDATOR_PROMPT, MERMAID_PROMPT } = require('./prompt
  * @returns {object|null}
  */
 function extractProcessModel(text) {
-  const match = text.match(/<process_model>([\s\S]*?)<\/process_model>/)
-  if (!match) return null
+  const strictMatch = text.match(/<process_model>([\s\S]*?)<\/process_model>/i)
+  if (strictMatch) {
+    try {
+      return JSON.parse(strictMatch[1].trim())
+    } catch {
+      // fall through to tolerant parsing below
+    }
+  }
+
+  // Tolerant mode: model block may be truncated and miss closing tag.
+  const openIdx = text.toLowerCase().indexOf('<process_model>')
+  if (openIdx < 0) return null
+
+  const afterOpen = text.slice(openIdx + '<process_model>'.length)
+  const startJson = afterOpen.indexOf('{')
+  if (startJson < 0) return null
+
+  const jsonChunk = afterOpen.slice(startJson)
+  const balanced = extractBalancedJsonObject(jsonChunk)
+  if (!balanced) return null
+
   try {
-    return JSON.parse(match[1].trim())
+    return JSON.parse(balanced)
   } catch {
     return null
   }
@@ -24,10 +43,68 @@ function extractProcessModel(text) {
  * @returns {string}
  */
 function extractBotText(text) {
-  return text
-    .replace(/<process_model>[\s\S]*?<\/process_model>/g, '')
+  const openTagRegex = /<process_model>/i
+  const closeTagRegex = /<\/process_model>/i
+  let sanitized = text
+
+  // Remove full technical block when both tags exist.
+  sanitized = sanitized.replace(/<process_model>[\s\S]*?<\/process_model>/gi, '')
+
+  // If the model block is malformed (missing closing tag), drop everything from open tag.
+  if (openTagRegex.test(sanitized) && !closeTagRegex.test(sanitized)) {
+    sanitized = sanitized.replace(/<process_model>[\s\S]*/i, '')
+  }
+
+  return sanitized
     .replace(/###INTERVIEW_COMPLETE###/g, '')
+    .replace(/```json\s*[\s\S]*?```/gi, '')
+    .replace(/```[\s\S]*?```/g, '')
     .trim()
+}
+
+function extractBalancedJsonObject(input) {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  let started = false
+
+  for (let i = 0; i < input.length; i += 1) {
+    const ch = input[i]
+
+    if (!started) {
+      if (ch === '{') {
+        started = true
+        depth = 1
+      }
+      continue
+    }
+
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (ch === '\\') {
+        escaped = true
+      } else if (ch === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+
+    if (ch === '{') depth += 1
+    if (ch === '}') depth -= 1
+
+    if (depth === 0) {
+      const start = input.indexOf('{')
+      return input.slice(start, i + 1)
+    }
+  }
+
+  return ''
 }
 
 /**
