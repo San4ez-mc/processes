@@ -84,12 +84,14 @@ async function handleMessage(userId, text) {
   }
 
   // ── Крок 2: валідація після завершення інтерв'ю ──
+  console.log(`[bot] User ${userId}: Interview complete, starting validation...`)
   if (session.validation_attempts < MAX_VALIDATION_ATTEMPTS) {
     let validationResult
     try {
       validationResult = await runValidator(session.process_model)
+      console.log(`[bot] User ${userId}: Validator OK, valid=${validationResult?.valid}`)
     } catch (err) {
-      console.error('[bot] Validator error:', err.message)
+      console.error(`[bot] User ${userId}: Validator ERROR:`, err.message)
       validationResult = { valid: true, errors: [] }
     }
 
@@ -113,36 +115,51 @@ async function handleMessage(userId, text) {
   }
 
   // ── Крок 3: генерація Mermaid та рендер PNG ──
+  console.log(`[bot] User ${userId}: Starting Mermaid generation...`)
   await safeSendMessage(userId, '⏳ Будую схему вашого бізнес-процесу...')
 
   let mermaidCode
   try {
+    console.log(`[bot] User ${userId}: Calling runMermaidGenerator...`)
     mermaidCode = await runMermaidGenerator(session.process_model)
+    console.log(`[bot] User ${userId}: Mermaid OK, code length=${mermaidCode?.length}`)
     session.process_model.mermaid_code = mermaidCode
     session.mermaid_code = mermaidCode
   } catch (err) {
-    console.error('[bot] Mermaid generator error:', err.message)
+    console.error(`[bot] User ${userId}: Mermaid generator ERROR:`, err.message)
     session.status = 'complete'
-    await db.saveSession(session).catch(() => {})
+    session.process_model.status = 'complete'
+    try {
+      await db.saveSession(session)
+    } catch (saveErr) {
+      console.error('[bot] Save after Mermaid error failed:', saveErr.message)
+    }
     await safeSendMessage(userId, COMPLETION_MESSAGE)
+    await safeSendMessage(userId, '❌ Помилка генерації схеми')
     return
   }
 
   let pngBuffer
   try {
+    console.log(`[bot] User ${userId}: Calling renderMermaid...`)
     pngBuffer = await renderMermaid(mermaidCode)
+    console.log(`[bot] User ${userId}: PNG render OK, size=${pngBuffer?.length} bytes`)
   } catch (err) {
-    console.error('[bot] Mermaid render error:', err.message)
-    // Відправляємо код схеми текстом якщо рендер не вдався
+    console.error(`[bot] User ${userId}: Render ERROR:`, err.message)
     session.status = 'complete'
     session.process_model.status = 'complete'
-    await db.saveSession(session).catch(() => {})
+    try {
+      await db.saveSession(session)
+    } catch (saveErr) {
+      console.error('[bot] Save after render error failed:', saveErr.message)
+    }
     await safeSendMessage(userId, COMPLETION_MESSAGE)
-    await safeSendMessage(userId, `📊 Схема (текстовий код для mermaid.live):\n\`\`\`\n${mermaidCode}\n\`\`\``)
+    await safeSendMessage(userId, '📊 Схема (текстовим кодом)...')
     return
   }
 
   // ── Успіх: зберігаємо і відправляємо ──
+  console.log(`[bot] User ${userId}: Sending completion...`)
   session.status = 'complete'
   session.process_model.status = 'complete'
   try {
@@ -152,12 +169,14 @@ async function handleMessage(userId, text) {
   }
 
   try {
+    console.log(`[bot] User ${userId}: Sending photo...`)
     await bot.sendPhoto(userId, pngBuffer, { caption: 'Схема бізнес-процесу вашої компанії' })
   } catch (err) {
     console.error('[bot] sendPhoto error:', err.message)
-    await safeSendMessage(userId, `📊 \`\`\`\n${mermaidCode}\n\`\`\``)
+    await safeSendMessage(userId, '📊 Схема отримана')
   }
   await safeSendMessage(userId, COMPLETION_MESSAGE)
+  console.log(`[bot] User ${userId}: ==================== INTERVIEW FULLY COMPLETE ====================`)
 }
 
 // ─── Команди ─────────────────────────────────────────────────────────────────
