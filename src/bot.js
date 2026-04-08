@@ -169,9 +169,20 @@ async function handleMessage(userId, text) {
     console.error('[bot] DB saveSession error:', err.message)
   }
 
+  // Отправляємо фото і inline-кнопки
   try {
-    console.log(`[bot] User ${userId}: Sending photo...`)
-    await bot.sendPhoto(userId, pngBuffer, { caption: 'Схема бізнес-процесу вашої компанії' })
+    console.log(`[bot] User ${userId}: Sending photo with action buttons...`)
+    await bot.sendPhoto(userId, pngBuffer, {
+      caption: '📋 Схема бізнес-процесу вашої компанії',
+      reply_markup: JSON.stringify({
+        inline_keyboard: [
+          [
+            { text: '➡️ Повернутись і редагувати', callback_data: 'action_restart' },
+            { text: '📑 Завантажити', callback_data: 'action_download' }
+          ]
+        ]
+      })
+    })
   } catch (err) {
     console.error('[bot] sendPhoto error:', err.message)
     await safeSendMessage(userId, '📊 Схема отримана')
@@ -189,14 +200,14 @@ bot.onText(/\/start/, async (msg) => {
   } catch (err) {
     console.error('[bot] deleteSession error:', db.formatDbError(err))
   }
-  
+
   // Відправляємо профіль-фото спочатку
   try {
-    await bot.sendPhoto(userId, PROFILE_PHOTO_PATH, { caption: 'Дозвіл на внесення цього профіля' })
+    await bot.sendPhoto(userId, PROFILE_PHOTO_PATH)
   } catch (err) {
     console.warn('[bot] Failed to send profile photo:', err.message)
   }
-  
+
   await safeSendMessage(userId, START_MESSAGE)
 })
 
@@ -237,6 +248,56 @@ bot.on('message', async (msg) => {
   if (!text) return
 
   await handleMessage(userId, text)
+})
+
+// ─── Обробник callback buttons ───────────────────────────────
+
+bot.on('callback_query', async (query) => {
+  const userId = query.from.id
+  const action = query.data
+
+  try {
+    if (action === 'action_restart') {
+      console.log(`[bot] User ${userId}: Clicked restart button`)
+      await db.deleteSession(userId)
+      await bot.answerCallbackQuery(query.id, { text: '🔄 Прискорінюючи...' })
+      await safeSendMessage(userId, `Повернення до редагування ❀️\n\n${START_MESSAGE}`)
+    } else if (action === 'action_download') {
+      console.log(`[bot] User ${userId}: Clicked download button`)
+      const session = await db.getOrCreateSession(userId)
+      if (session.mermaid_code && session.process_model?.mermaid_code) {
+        await bot.answerCallbackQuery(query.id, { text: '📑 Готово...' })
+        await safeSendMessage(userId,
+          `📋 Мермайд код:\n\`\`\`\n${session.mermaid_code.substring(0, 2000)}\n\`\`\`\n\n[Вкопіюйте чи використайте на mermaid.live]`)
+      } else {
+        await bot.answerCallbackQuery(query.id, { text: '❌ Схема не готова', show_alert: true })
+      }
+    }
+  } catch (err) {
+    console.error(`[bot] callback error User ${userId}:`, err.message)
+    await bot.answerCallbackQuery(query.id, { text: '⚠️ Помилка', show_alert: true })
+  }
+})
+
+// ─── Обробник голосових повідомлень ───────────────────────────────
+
+bot.on('voice', async (msg) => {
+  const userId = msg.chat.id
+  console.log(`[bot] User ${userId}: Received voice message`)
+  
+  const voiceDescription = `[голосове повідомлення, ${Math.round(msg.voice.duration)}s]`
+  await handleMessage(userId, voiceDescription)
+})
+
+// ─── Обробник документів ──────────────────────────────────────────────────────
+
+bot.on('document', async (msg) => {
+  const userId = msg.chat.id
+  const fileName = msg.document?.file_name || 'невизначений файл'
+  console.log(`[bot] User ${userId}: Received document: ${fileName}`)
+  
+  const docDescription = `[документ: ${fileName}]`
+  await handleMessage(userId, docDescription)
 })
 
 // ─── Обробка помилок ──────────────────────────────────────────────────────────
