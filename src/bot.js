@@ -83,7 +83,8 @@ async function handleMessage(userId, text) {
     try {
       const completeness = await runValidator(session.process_model)
       const checklist = buildCompletenessChecklist(session.process_model)
-      await safeSendMessage(userId, formatChecklistMessage(checklist))
+      const done = checklist.filter((c) => c.ok).length
+      console.log(`[bot] User ${userId}: Internal completeness checklist ${done}/${checklist.length}`)
 
       if (completeness?.valid) {
         console.log(`[bot] User ${userId}: Document appears complete, moving to finalization.`)
@@ -92,7 +93,10 @@ async function handleMessage(userId, text) {
           agentResponse.text = 'Дякую, я проаналізував документ. Даних достатньо — формую фінальну схему.'
         }
       } else {
-        const followUp = completeness?.errors?.[0]?.question_to_ask
+        let followUp = completeness?.errors?.[0]?.question_to_ask
+        if (!followUp) {
+          followUp = buildFollowUpFromChecklist(checklist)
+        }
         if (followUp) {
           const prefix = 'Я проаналізував документ. Щоб завершити схему, уточніть, будь ласка:'
           agentResponse.text = `${prefix}\n\n${followUp}`
@@ -608,6 +612,34 @@ function formatChecklistMessage(checklist) {
   const total = checklist.length
   const lines = checklist.map((c) => `${c.ok ? '✅' : '❌'} ${c.label}`)
   return `Чекліст повноти процесу (${done}/${total}):\n\n${lines.join('\n')}`
+}
+
+function buildFollowUpFromChecklist(checklist) {
+  const firstMissing = checklist.find((c) => !c.ok)
+  if (!firstMissing) return ''
+
+  if (firstMissing.label.includes('стартовий вузол')) {
+    return 'З чого починається ваш процес: як саме зʼявляється новий клієнт або заявка?'
+  }
+  if (firstMissing.label.includes('фінальний вузол')) {
+    return 'Яка кінцева точка процесу: що саме вважаємо завершенням роботи з клієнтом?'
+  }
+  if (firstMissing.label.includes('залучення клієнта')) {
+    return 'Опишіть, будь ласка, етап залучення клієнта: звідки приходить лід і хто його обробляє першим?'
+  }
+  if (firstMissing.label.includes('продажу/кваліфікації')) {
+    return 'Опишіть етап продажу: як кваліфікуєте клієнта, робите пропозицію і отримуєте підтвердження?'
+  }
+  if (firstMissing.label.includes('виконання/операцій')) {
+    return 'Опишіть етап виконання: які ключові кроки після погодження з клієнтом і хто за них відповідає?'
+  }
+  if (firstMissing.label.includes('оплати і закриття')) {
+    return 'Як відбувається оплата і закриття угоди: хто виставляє рахунок, хто контролює надходження, що є фінальним кроком?'
+  }
+  if (firstMissing.label.includes('фінансова роль')) {
+    return 'Хто у вас відповідає за фінансову частину: оплати, облік і звітність?'
+  }
+  return 'Є ще одна прогалина в процесі. Уточніть, будь ласка, що відбувається між поточними кроками, щоб ланцюжок був повним.'
 }
 
 // ─── Запуск ───────────────────────────────────────────────────────────────────
