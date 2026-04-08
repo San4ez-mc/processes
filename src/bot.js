@@ -299,6 +299,7 @@ bot.on('voice', async (msg) => {
 bot.on('document', async (msg) => {
   const userId = msg.chat.id
   const fileName = msg.document?.file_name || 'невизначений файл'
+  const mimeType = msg.document?.mime_type || ''
   console.log(`[bot] User ${userId}: Received document: ${fileName}`)
 
   try {
@@ -310,7 +311,8 @@ bot.on('document', async (msg) => {
 
     await safeSendMessage(userId, '📄 Читаю документ...')
     const fileBuffer = await downloadTelegramFile(fileId)
-    const extractedText = await extractTextFromDocument(fileBuffer, fileName, msg.document?.mime_type)
+    console.log(`[bot] User ${userId}: Document meta: mime=${mimeType || 'n/a'}, size=${fileBuffer.length}`)
+    const extractedText = await extractTextFromDocument(fileBuffer, fileName, mimeType)
 
     if (!extractedText) {
       await safeSendMessage(userId, 'Не вдалося прочитати текст з документа. Підтримуються: TXT, PDF, DOCX.')
@@ -324,7 +326,7 @@ bot.on('document', async (msg) => {
     const payload = `[з документа ${fileName}]\n${normalized.substring(0, 5000)}`
     await handleMessage(userId, payload)
   } catch (err) {
-    console.error(`[bot] User ${userId}: Document processing failed:`, err.message)
+    console.error(`[bot] User ${userId}: Document processing failed:`, err.message, err.stack || '')
     await safeSendMessage(userId, 'Не вдалося обробити документ. Підтримуються: TXT, PDF, DOCX.')
   }
 })
@@ -378,7 +380,11 @@ async function launchScenario(userId, payload) {
 }
 
 async function downloadTelegramFile(fileId) {
-  const fileUrl = await bot.getFileLink(fileId)
+  const fileMeta = await bot.getFile(fileId)
+  if (!fileMeta || !fileMeta.file_path) {
+    throw new Error('Telegram did not return file_path for document')
+  }
+  const fileUrl = `https://api.telegram.org/file/bot${config.telegram.token}/${fileMeta.file_path}`
   const response = await fetch(fileUrl)
   if (!response.ok) {
     throw new Error(`Failed to download Telegram file: HTTP ${response.status}`)
@@ -391,19 +397,27 @@ async function extractTextFromDocument(fileBuffer, fileName = '', mimeType = '')
   const ext = path.extname(fileName).toLowerCase()
 
   if (ext === '.txt' || mimeType === 'text/plain') {
-    return fileBuffer.toString('utf8')
+    return decodeTextBuffer(fileBuffer)
   }
 
   if (ext === '.pdf' || mimeType === 'application/pdf') {
-    const pdfParse = require('pdf-parse')
-    const result = await pdfParse(fileBuffer)
-    return result.text || ''
+    try {
+      const pdfParse = require('pdf-parse')
+      const result = await pdfParse(fileBuffer)
+      return result.text || ''
+    } catch (err) {
+      throw new Error(`PDF parse failed: ${err.message}`)
+    }
   }
 
   if (ext === '.docx' || mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-    const mammoth = require('mammoth')
-    const result = await mammoth.extractRawText({ buffer: fileBuffer })
-    return result.value || ''
+    try {
+      const mammoth = require('mammoth')
+      const result = await mammoth.extractRawText({ buffer: fileBuffer })
+      return result.value || ''
+    } catch (err) {
+      throw new Error(`DOCX parse failed: ${err.message}`)
+    }
   }
 
   if (ext === '.doc' || mimeType === 'application/msword') {
@@ -411,16 +425,24 @@ async function extractTextFromDocument(fileBuffer, fileName = '', mimeType = '')
   }
 
   // Якщо не вдалось визначити тип по розширенню — пробуємо як текст
-  try {
-    const asText = fileBuffer.toString('utf8')
-    if (asText.trim().length > 0) {
-      return asText
-    }
-  } catch {
-    // ignore
+  const asText = decodeTextBuffer(fileBuffer)
+  if (asText.trim().length > 0) {
+    return asText
   }
 
   return ''
+}
+
+function decodeTextBuffer(fileBuffer) {
+  if (!fileBuffer || fileBuffer.length === 0) return ''
+
+  // UTF-8
+  let text = fileBuffer.toString('utf8').replace(/^\uFEFF/, '').replace(/\u0000/g, '')
+  if (text.trim().length > 0) return text
+
+  // Latin-1 fallback (для випадків не-UTF8 txt)
+  text = fileBuffer.toString('latin1').replace(/\u0000/g, '')
+  return text
 }
 
 // ─── Запуск ───────────────────────────────────────────────────────────────────
