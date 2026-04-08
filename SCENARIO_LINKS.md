@@ -1,31 +1,18 @@
 # Посилання На Сценарії Telegram-Бота
 
-Замініть `<your_bot_username>` на ваш username бота в Telegram (без `@`).
+Username бота: `fineko_processes_bot`.
 
 ## 1) Основний Бізнес-Процес (вже реалізовано)
 Опис: повний сценарій від залучення клієнта до оплати і завершення.
 
 Посилання:
-https://t.me/<your_bot_username>?start=main_process
+https://t.me/fineko_processes_bot?start=main_process
 
-## 2) Продаж І Кваліфікація
-Опис: швидкий старт з етапу продажу (блок 2), фокус на заявці, контакті, КП, згоді.
-
-Посилання:
-https://t.me/<your_bot_username>?start=sales_process
-
-## 3) Виконання І Виробництво
-Опис: старт з операційної частини (блок 3), фокус на виконанні замовлення.
-
-Посилання:
-https://t.me/<your_bot_username>?start=operations_process
-
-## 4) Оплата І Закриття
-Опис: старт з фінансового блоку (блок 4), фокус на рахунках, оплаті, актах.
-
-Посилання:
-https://t.me/<your_bot_username>?start=finance_process
+## Заплановані Сценарії (ще не активні)
+- `sales_process` — продаж і кваліфікація
+- `operations_process` — виконання і виробництво
+- `finance_process` — оплата і закриття
 
 ## Примітка
-- Якщо payload невідомий, бот автоматично запускає `main_process`.
+- Якщо payload відрізняється від `main_process`, бот повідомляє що сценарій у розробці і запускає `main_process`.
 - Для коректної обробки голосових потрібен `OPENAI_API_KEY` (Whisper).
