@@ -1,6 +1,25 @@
 'use strict'
 require('dotenv').config()
 
+function normalizeBaseUrl(url) {
+  return String(url || '').trim().replace(/\/+$/, '')
+}
+
+function resolveWebhookBaseUrl() {
+  const explicitUrl = normalizeBaseUrl(process.env.TELEGRAM_WEBHOOK_URL)
+  if (explicitUrl) return explicitUrl
+
+  const railwayDomain = String(process.env.RAILWAY_PUBLIC_DOMAIN || '').trim()
+  if (railwayDomain) {
+    return `https://${railwayDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '')}`
+  }
+
+  const railwayStaticUrl = normalizeBaseUrl(process.env.RAILWAY_STATIC_URL)
+  if (railwayStaticUrl) return railwayStaticUrl
+
+  return ''
+}
+
 const required = ['TELEGRAM_BOT_TOKEN', 'DATABASE_URL']
 const missing = required.filter((key) => !process.env[key])
 if (missing.length > 0) {
@@ -19,10 +38,16 @@ if (provider === 'openai' && !process.env.OPENAI_API_KEY) {
 }
 
 const dbSslEnabled = (process.env.DB_SSL || 'false').toLowerCase() === 'true'
+const webhookBaseUrl = resolveWebhookBaseUrl()
+const webhookPath = process.env.TELEGRAM_WEBHOOK_PATH || `/telegram/webhook/${process.env.TELEGRAM_WEBHOOK_SECRET || 'business-process-agent'}`
+const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET || ''
 
 module.exports = {
   telegram: {
     token: process.env.TELEGRAM_BOT_TOKEN,
+    webhookBaseUrl,
+    webhookPath,
+    webhookSecret,
   },
   llm: {
     provider,

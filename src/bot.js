@@ -4,7 +4,6 @@ require('./config') // Запускає валідацію env змінних о
 
 const TelegramBot = require('node-telegram-bot-api')
 const http = require('http')
-const fs = require('fs')
 const path = require('path')
 const config = require('./config')
 const db = require('./db')
@@ -35,10 +34,12 @@ const PROFILE_PHOTO_PATH = path.join(__dirname, '..', 'profile.jpg')
 const PORT = Number(process.env.PORT || 3000)
 const SCENARIO_MAIN = 'main_process'
 const MAX_VALIDATION_ATTEMPTS = 3
+const WEBHOOK_PATH = normalizeWebhookPath(config.telegram.webhookPath)
+const WEBHOOK_URL = buildWebhookUrl(config.telegram.webhookBaseUrl, WEBHOOK_PATH)
 
 // ─── Telegram бот ────────────────────────────────────────────────────────────
 
-const bot = new TelegramBot(config.telegram.token, { polling: true })
+const bot = new TelegramBot(config.telegram.token)
 
 // ─── Головний обробник повідомлень ───────────────────────────────────────────
 
@@ -345,8 +346,8 @@ process.on('uncaughtException', (err) => {
 
 // ─── Обробка помилок ──────────────────────────────────────────────────────────
 
-bot.on('polling_error', (err) => {
-  console.error('[bot] Polling error:', err.message)
+bot.on('webhook_error', (err) => {
+  console.error('[bot] Webhook error:', err.message)
 })
 
 bot.on('error', (err) => {
@@ -693,6 +694,69 @@ function buildFollowUpFromChecklist(checklist) {
   return 'Є ще одна прогалина в процесі. Уточніть, будь ласка, що відбувається між поточними кроками, щоб ланцюжок був повним.'
 }
 
+function normalizeWebhookPath(rawPath) {
+  const value = String(rawPath || '/telegram/webhook').trim()
+  return value.startsWith('/') ? value : `/${value}`
+}
+
+function buildWebhookUrl(baseUrl, webhookPath) {
+  const normalizedBase = String(baseUrl || '').trim().replace(/\/+$/, '')
+  return normalizedBase ? `${normalizedBase}${webhookPath}` : ''
+}
+
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', () => resolve(Buffer.concat(chunks)))
+    req.on('error', reject)
+  })
+}
+
+function startHttpServer() {
+  const server = http.createServer(async (req, res) => {
+    if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ ok: true, mode: 'webhook' }))
+      return
+    }
+
+    if (req.method === 'POST' && req.url === WEBHOOK_PATH) {
+      try {
+        if (config.telegram.webhookSecret) {
+          const secretHeader = req.headers['x-telegram-bot-api-secret-token']
+          if (secretHeader !== config.telegram.webhookSecret) {
+            res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' })
+            res.end(JSON.stringify({ ok: false, error: 'invalid webhook secret' }))
+            return
+          }
+        }
+
+        const rawBody = await readRequestBody(req)
+        const update = JSON.parse(rawBody.toString('utf8') || '{}')
+        await bot.processUpdate(update)
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify({ ok: true }))
+      } catch (err) {
+        console.error('[bot] Webhook request error:', err.message)
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify({ ok: false }))
+      }
+      return
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' })
+    res.end(JSON.stringify({ ok: false, error: 'not found' }))
+  })
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`[bot] Health server listening on 0.0.0.0:${PORT}`)
+    console.log(`[bot] Webhook endpoint ready at ${WEBHOOK_PATH}`)
+  })
+
+  return server
+}
+
 // ─── Запуск ───────────────────────────────────────────────────────────────────
 
 console.log(`[bot] Starting business-process-agent...`)
@@ -701,7 +765,7 @@ console.log(`[bot] LLM Provider: ${config.llm.provider} | Model: ${config.llm.mo
 bootstrap()
 
 async function bootstrap() {
-  startHealthServer()
+  startHttpServer()
   let dbReady = false
   try {
     await db.ensureReady({ retries: 10, delayMs: 5000 })
@@ -711,25 +775,23 @@ async function bootstrap() {
     console.error('[bot] Check DATABASE_URL variable in Railway Variables tab!')
     // НЕ падаємо — health server живий, але бот відповідатиме «технічна помилка»
   }
+  if (!WEBHOOK_URL) {
+    console.error('[bot] TELEGRAM_WEBHOOK_URL / RAILWAY_PUBLIC_DOMAIN is not configured; webhook registration skipped.')
+    console.error('[bot] Set TELEGRAM_WEBHOOK_URL or expose the app through Railway public domain.')
+  } else {
+    try {
+      await bot.setWebHook(WEBHOOK_URL, config.telegram.webhookSecret
+        ? { secret_token: config.telegram.webhookSecret }
+        : {})
+      console.log(`[bot] Telegram webhook registered: ${WEBHOOK_URL}`)
+    } catch (err) {
+      console.error('[bot] Failed to register Telegram webhook:', err.message)
+    }
+  }
+
   if (dbReady) {
     console.log('[bot] Bot is fully running. Press Ctrl+C to stop.')
   } else {
     console.log('[bot] Bot started WITHOUT DB — will respond with error to users.')
   }
-}
-
-function startHealthServer() {
-  const server = http.createServer((req, res) => {
-    if (req.url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
-      res.end(JSON.stringify({ ok: true, service: 'business-process-agent' }))
-      return
-    }
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
-    res.end('OK')
-  })
-
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`[bot] Health server listening on 0.0.0.0:${PORT}`)
-  })
 }
