@@ -757,6 +757,21 @@ function startHttpServer() {
   return server
 }
 
+async function logWebhookStatus() {
+  try {
+    const info = await bot.getWebHookInfo()
+    console.log(`[bot] Webhook status: url=${info.url || 'n/a'}, pending_updates=${info.pending_update_count || 0}`)
+    if (info.last_error_message) {
+      console.error(`[bot] Webhook last error: ${info.last_error_message}`)
+    }
+    if (info.last_synchronization_error_date) {
+      console.error(`[bot] Webhook last sync error date: ${info.last_synchronization_error_date}`)
+    }
+  } catch (err) {
+    console.error('[bot] Failed to read Telegram webhook status:', err.message)
+  }
+}
+
 // ─── Запуск ───────────────────────────────────────────────────────────────────
 
 console.log(`[bot] Starting business-process-agent...`)
@@ -784,6 +799,7 @@ async function bootstrap() {
         ? { secret_token: config.telegram.webhookSecret }
         : {})
       console.log(`[bot] Telegram webhook registered: ${WEBHOOK_URL}`)
+      await logWebhookStatus()
     } catch (err) {
       console.error('[bot] Failed to register Telegram webhook:', err.message)
     }
