@@ -1,4 +1,5 @@
 'use strict'
+process.env.NTBA_FIX_350 = 1 // Use improved file content-type detection
 require('./config') // Запускає валідацію env змінних одразу при старті
 
 const TelegramBot = require('node-telegram-bot-api')
@@ -187,7 +188,7 @@ async function handleMessage(userId, text) {
     console.log(`[bot] User ${userId}: Sending final schema photo...`)
     await bot.sendPhoto(userId, pngBuffer, {
       caption: '📋 Схема бізнес-процесу вашої компанії'
-    })
+    }, { contentType: 'image/png' })
   } catch (err) {
     console.error('[bot] sendPhoto error:', err.message)
     await safeSendMessage(userId, '📊 Схема отримана')
