@@ -4,6 +4,9 @@ const path = require('path')
 const https = require('https')
 const config = require('./config')
 
+const forceApiRender = String(process.env.MERMAID_RENDER_MODE || '').toLowerCase() === 'api'
+let localFailureLogged = false
+
 /**
  * Рендеринг Mermaid-коду у PNG через mermaid-cli (локально)
  * Fallback: mermaid.ink API
@@ -11,12 +14,26 @@ const config = require('./config')
  * @returns {Promise<Buffer>}
  */
 async function renderMermaid(mermaidCode) {
+  if (forceApiRender) {
+    return await renderMermaidViaAPI(mermaidCode)
+  }
+
   try {
     return await renderMermaidLocal(mermaidCode)
   } catch (err) {
-    console.warn('[mermaid] Local render failed, using API fallback:', err.message)
+    if (!localFailureLogged) {
+      console.warn('[mermaid] Local render unavailable, switching to API fallback.')
+      console.warn(`[mermaid] Reason: ${summarizeRenderError(err)}`)
+      localFailureLogged = true
+    }
     return await renderMermaidViaAPI(mermaidCode)
   }
+}
+
+function summarizeRenderError(err) {
+  const message = String(err?.message || err || '').trim()
+  const firstLine = message.split('\n')[0]
+  return firstLine || 'unknown local render error'
 }
 
 /**
