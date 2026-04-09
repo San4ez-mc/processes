@@ -36,6 +36,8 @@ const SCENARIO_MAIN = 'main_process'
 const MAX_VALIDATION_ATTEMPTS = 3
 const WEBHOOK_PATH = normalizeWebhookPath(config.telegram.webhookPath)
 const WEBHOOK_URL = buildWebhookUrl(config.telegram.webhookBaseUrl, WEBHOOK_PATH)
+let httpServer = null
+let isShuttingDown = false
 
 // ─── Telegram бот ────────────────────────────────────────────────────────────
 
@@ -734,9 +736,15 @@ function startHttpServer() {
 
         const rawBody = await readRequestBody(req)
         const update = JSON.parse(rawBody.toString('utf8') || '{}')
-        await bot.processUpdate(update)
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
         res.end(JSON.stringify({ ok: true }))
+
+        // Process update asynchronously so Telegram webhook call is acknowledged quickly.
+        Promise.resolve()
+          .then(() => bot.processUpdate(update))
+          .catch((err) => {
+            console.error('[bot] Async processUpdate error:', err.message)
+          })
       } catch (err) {
         console.error('[bot] Webhook request error:', err.message)
         res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' })
@@ -780,7 +788,7 @@ console.log(`[bot] LLM Provider: ${config.llm.provider} | Model: ${config.llm.mo
 bootstrap()
 
 async function bootstrap() {
-  startHttpServer()
+  httpServer = startHttpServer()
   let dbReady = false
   try {
     await db.ensureReady({ retries: 10, delayMs: 5000 })
@@ -811,3 +819,30 @@ async function bootstrap() {
     console.log('[bot] Bot started WITHOUT DB — will respond with error to users.')
   }
 }
+
+async function shutdown(signal) {
+  if (isShuttingDown) return
+  isShuttingDown = true
+  console.log(`[bot] Received ${signal}. Starting graceful shutdown...`)
+
+  try {
+    if (httpServer) {
+      await new Promise((resolve) => httpServer.close(resolve))
+      console.log('[bot] HTTP server closed')
+    }
+    await db.close()
+    console.log('[bot] Graceful shutdown completed')
+    process.exit(0)
+  } catch (err) {
+    console.error('[bot] Graceful shutdown failed:', err.message)
+    process.exit(1)
+  }
+}
+
+process.on('SIGTERM', () => {
+  shutdown('SIGTERM')
+})
+
+process.on('SIGINT', () => {
+  shutdown('SIGINT')
+})

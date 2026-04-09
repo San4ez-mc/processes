@@ -55,6 +55,7 @@ module.exports = {
     openaiApiKey: process.env.OPENAI_API_KEY,
     model: process.env.LLM_MODEL || (provider === 'anthropic' ? 'claude-sonnet-4-5' : 'gpt-4o'),
     maxTokens: 2048,
+    timeoutMs: Number(process.env.LLM_TIMEOUT_MS || 45000),
   },
   db: {
     connectionString: process.env.DATABASE_URL,
