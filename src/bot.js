@@ -42,7 +42,6 @@ const bot = new TelegramBot(config.telegram.token, { polling: true })
 // ─── Головний обробник повідомлень ───────────────────────────────────────────
 
 async function handleMessage(userId, text) {
-  const isDocumentInput = typeof text === 'string' && text.startsWith('[з документа ')
   let session
   try {
     session = await db.getOrCreateSession(userId)
@@ -76,38 +75,6 @@ async function handleMessage(userId, text) {
   // Оновлюємо JSON-модель якщо агент повернув її
   if (agentResponse.updatedModel) {
     session.process_model = agentResponse.updatedModel
-  }
-
-  // Якщо вхід з документа — явно перевіряємо повноту моделі одразу.
-  // valid=true -> відразу фіналізуємо, valid=false -> задаємо точне уточнююче питання.
-  if (isDocumentInput) {
-    console.log(`[bot] User ${userId}: Running completeness check for document input...`)
-    try {
-      await sendChatAction(userId, 'typing')
-      const completeness = await runValidator(session.process_model)
-      const checklist = buildCompletenessChecklist(session.process_model)
-      const done = checklist.filter((c) => c.ok).length
-      console.log(`[bot] User ${userId}: Internal completeness checklist ${done}/${checklist.length}`)
-
-      if (completeness?.valid) {
-        console.log(`[bot] User ${userId}: Document appears complete, moving to finalization.`)
-        agentResponse.isComplete = true
-        if (!agentResponse.text || agentResponse.text.trim().length < 3) {
-          agentResponse.text = 'Дякую, я проаналізував документ. Даних достатньо — формую фінальну схему.'
-        }
-      } else {
-        let followUp = completeness?.errors?.[0]?.question_to_ask
-        if (!followUp) {
-          followUp = buildFollowUpFromChecklist(checklist)
-        }
-        if (followUp) {
-          const prefix = 'Я проаналізував документ. Щоб завершити схему, уточніть, будь ласка:'
-          agentResponse.text = `${prefix}\n\n${followUp}`
-        }
-      }
-    } catch (err) {
-      console.error(`[bot] User ${userId}: Completeness check failed:`, err.message)
-    }
   }
 
   // ── Якщо інтерв'ю ще не завершено — звичайна відповідь ──
