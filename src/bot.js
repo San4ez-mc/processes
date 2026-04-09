@@ -81,6 +81,43 @@ async function handleMessage(userId, text) {
     session.process_model = agentResponse.updatedModel
   }
 
+  // Єдиний флоу достатності даних: якщо модель вже достатньо повна,
+  // завершуємо сценарій навіть якщо LLM не додав явний completion marker.
+  if (!agentResponse.isComplete) {
+    try {
+      await sendChatAction(userId, 'typing')
+      const sufficiencyValidation = await runValidator(session.process_model)
+      const checklist = buildCompletenessChecklist(session.process_model)
+
+      const coreCoverage = [7, 8, 9, 10, 11].every((idx) => checklist[idx]?.ok)
+      const structuralCoverage = [0, 1, 5].every((idx) => checklist[idx]?.ok)
+      const sufficientForFinalization = Boolean(sufficiencyValidation?.valid) || (coreCoverage && structuralCoverage)
+
+      if (sufficientForFinalization) {
+        agentResponse.isComplete = true
+        if (!agentResponse.text || !agentResponse.text.trim()) {
+          agentResponse.text = 'Дякую, інформації достатньо. Формую фінальну схему процесу.'
+        }
+        console.log(`[bot] User ${userId}: Auto-complete enabled by unified sufficiency check.`)
+      }
+    } catch (err) {
+      console.error(`[bot] User ${userId}: Unified sufficiency check failed:`, err.message)
+    }
+  }
+
+  // Fallback: інколи модель повертає лише технічний блок без тексту для користувача.
+  // Щоб бот не мовчав, генеруємо уточнююче питання на основі поточної моделі.
+  if (!agentResponse.isComplete && (!agentResponse.text || !agentResponse.text.trim())) {
+    const checklist = buildCompletenessChecklist(session.process_model)
+    const followUp = buildFollowUpFromChecklist(checklist)
+    agentResponse.text = followUp
+      ? `Дякую, я зафіксував інформацію. Уточніть, будь ласка:
+
+${followUp}`
+      : 'Дякую, я зафіксував інформацію. Щоб завершити схему, уточніть, будь ласка, хто відповідає за фінальний крок закриття угоди?'
+    console.warn(`[bot] User ${userId}: Interview agent returned empty bot text, fallback question sent.`)
+  }
+
   // ── Якщо інтерв'ю ще не завершено — звичайна відповідь ──
   if (!agentResponse.isComplete) {
     const botText = agentResponse.text
