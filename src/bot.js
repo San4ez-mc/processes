@@ -38,6 +38,7 @@ const WEBHOOK_PATH = normalizeWebhookPath(config.telegram.webhookPath)
 const WEBHOOK_URL = buildWebhookUrl(config.telegram.webhookBaseUrl, WEBHOOK_PATH)
 let httpServer = null
 let isShuttingDown = false
+const processedUpdateIds = new Set()
 
 // ─── Telegram бот ────────────────────────────────────────────────────────────
 
@@ -62,6 +63,12 @@ async function handleMessage(userId, text) {
 
   // Додаємо повідомлення користувача в історію
   session.history.push({ role: 'user', content: text })
+
+  // Якщо великий ввід — одразу повідомляємо що обробляємо
+  const isLargeInput = text.length > 500
+  if (isLargeInput) {
+    await safeSendMessage(userId, '⏳ Аналізую ваш опис, це займе кілька секунд...')
+  }
 
   // ── Крок 1: виклик інтерв'ю-агента ──
   let agentResponse
@@ -775,6 +782,20 @@ function startHttpServer() {
         const update = JSON.parse(rawBody.toString('utf8') || '{}')
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
         res.end(JSON.stringify({ ok: true }))
+
+        // Deduplicate: if this update was already processed, skip it.
+        const updateId = update.update_id
+        if (updateId && processedUpdateIds.has(updateId)) {
+          console.warn(`[bot] Duplicate update_id=${updateId} ignored`)
+          return
+        }
+        if (updateId) {
+          processedUpdateIds.add(updateId)
+          // Keep set bounded to last 200 IDs
+          if (processedUpdateIds.size > 200) {
+            processedUpdateIds.delete(processedUpdateIds.values().next().value)
+          }
+        }
 
         // Process update asynchronously so Telegram webhook call is acknowledged quickly.
         Promise.resolve()

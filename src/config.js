@@ -54,8 +54,8 @@ module.exports = {
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
     openaiApiKey: process.env.OPENAI_API_KEY,
     model: process.env.LLM_MODEL || (provider === 'anthropic' ? 'claude-sonnet-4-5' : 'gpt-4o'),
-    maxTokens: 2048,
-    timeoutMs: Number(process.env.LLM_TIMEOUT_MS || 45000),
+    maxTokens: Number(process.env.LLM_MAX_TOKENS || 4096),
+    timeoutMs: Number(process.env.LLM_TIMEOUT_MS || 90000),
   },
   db: {
     connectionString: process.env.DATABASE_URL,
