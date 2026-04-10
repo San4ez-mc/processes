@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   current_scenario    VARCHAR(50) NOT NULL DEFAULT 'main_process',
   process_model       JSONB NOT NULL DEFAULT '{}',
   cashflow_session    JSONB,
+  financial_reports_model JSONB,
   mermaid_code        TEXT,
   history             JSONB NOT NULL DEFAULT '[]',
   status              VARCHAR(20) NOT NULL DEFAULT 'draft',
@@ -21,6 +22,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS current_scenario VARCHAR(50) NOT NULL DEFAULT 'main_process';
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cashflow_session JSONB;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS financial_reports_model JSONB;
 
 CREATE INDEX IF NOT EXISTS idx_sessions_telegram_id ON sessions(telegram_id);
 

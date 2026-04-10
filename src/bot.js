@@ -313,6 +313,7 @@ async function handleCashflowMessage(userId, text, session) {
 
   nextCashflowSession.status = agentResponse.isComplete ? 'complete' : 'in_progress'
   session.cashflow_session = nextCashflowSession
+  session.financial_reports_model = buildFinancialReportsModel(session, nextCashflowSession)
   session.history = history
   session.status = agentResponse.isComplete ? 'complete' : 'draft'
 
@@ -356,6 +357,19 @@ function normalizeCashflowSession(cashflowSession) {
   normalized.items_count = Object.values(normalized.items).reduce((sum, list) => sum + list.length, 0)
   normalized.pl_structure = buildPLStructure(normalized.items)
   return normalized
+}
+
+function buildFinancialReportsModel(session, cashflowSession) {
+  return {
+    session_id: session.process_model?.session_id || session.id,
+    telegram_id: session.telegram_id,
+    business_type: session.process_model?.business_type || '',
+    cashflow_items: cashflowSession.items,
+    pl_structure: cashflowSession.pl_structure,
+    items_count: cashflowSession.items_count,
+    source: 'cashflow_items',
+    status: cashflowSession.status,
+  }
 }
 
 function normalizeCashflowItems(items) {
@@ -873,7 +887,7 @@ async function sendCashflowFiles(userId, session) {
     userId,
     cashflowDocBuffer,
     { caption: 'Файл 1/4: статті Cashflow з поясненнями' },
-    { filename: 'cashflow_articles.md', contentType: 'text/markdown' }
+    { filename: 'cashflow_articles.txt', contentType: 'text/plain' }
   )
 
   await sendChatAction(userId, 'upload_document')
@@ -881,7 +895,7 @@ async function sendCashflowFiles(userId, session) {
     userId,
     plDocBuffer,
     { caption: 'Файл 2/4: статті P&L з поясненнями' },
-    { filename: 'pl_articles.md', contentType: 'text/markdown' }
+    { filename: 'pl_articles.txt', contentType: 'text/plain' }
   )
 
   await sendInstructionDocs(userId)

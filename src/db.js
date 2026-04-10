@@ -65,6 +65,33 @@ function makeInitialCashflowSession() {
   }
 }
 
+function makeInitialFinancialReportsModel() {
+  return {
+    business_type: '',
+    cashflow_items: {
+      income: [],
+      cogs: [],
+      team: [],
+      operations: [],
+      taxes: [],
+    },
+    pl_structure: {
+      revenue: [],
+      cogs: [],
+      gross_profit: 'revenue - cogs',
+      opex: [],
+      operating_profit: 'gross_profit - opex',
+      owner_payout: [],
+      pre_tax_profit: 'operating_profit - owner_payout',
+      taxes: [],
+      net_profit: 'pre_tax_profit - taxes',
+    },
+    items_count: 0,
+    source: 'cashflow_items',
+    status: 'draft',
+  }
+}
+
 /**
  * Отримати сесію або створити нову
  * @param {number} telegramId
@@ -87,10 +114,10 @@ async function getOrCreateSession(telegramId) {
 
   const { rows: newRows } = await pool.query(
     `INSERT INTO sessions
-       (telegram_id, current_scenario, process_model, cashflow_session, history, status, validation_attempts, current_block, completed_blocks)
-     VALUES ($1, 'main_process', $2, $3, $4, 'draft', 0, 0, '[]')
+       (telegram_id, current_scenario, process_model, cashflow_session, financial_reports_model, history, status, validation_attempts, current_block, completed_blocks)
+     VALUES ($1, 'main_process', $2, $3, $4, $5, 'draft', 0, 0, '[]')
      RETURNING *`,
-    [telegramId, JSON.stringify(processModel), JSON.stringify(makeInitialCashflowSession()), JSON.stringify([])]
+    [telegramId, JSON.stringify(processModel), JSON.stringify(makeInitialCashflowSession()), JSON.stringify(makeInitialFinancialReportsModel()), JSON.stringify([])]
   )
 
   return rowToSession(newRows[0])
@@ -106,17 +133,19 @@ async function saveSession(session) {
        current_scenario    = $1,
        process_model       = $2,
        cashflow_session    = $3,
-       mermaid_code        = $4,
-       history             = $5,
-       status              = $6,
-       validation_attempts = $7,
-       current_block       = $8,
-       completed_blocks    = $9
-     WHERE telegram_id = $10`,
+       financial_reports_model = $4,
+       mermaid_code        = $5,
+       history             = $6,
+       status              = $7,
+       validation_attempts = $8,
+       current_block       = $9,
+       completed_blocks    = $10
+     WHERE telegram_id = $11`,
     [
       session.current_scenario || 'main_process',
       JSON.stringify(session.process_model),
       JSON.stringify(session.cashflow_session || makeInitialCashflowSession()),
+      JSON.stringify(session.financial_reports_model || makeInitialFinancialReportsModel()),
       session.mermaid_code || null,
       JSON.stringify(session.history || []),
       session.status,
@@ -143,6 +172,7 @@ function buildResetSession(session, scenario) {
     const sessionId = session.process_model?.session_id || session.id
     next.process_model = makeInitialProcessModel(sessionId)
     next.cashflow_session = makeInitialCashflowSession()
+    next.financial_reports_model = makeInitialFinancialReportsModel()
     next.mermaid_code = null
   }
 
@@ -242,6 +272,7 @@ function rowToSession(row) {
     current_scenario: row.current_scenario || 'main_process',
     process_model: row.process_model,
     cashflow_session: row.cashflow_session || makeInitialCashflowSession(),
+    financial_reports_model: row.financial_reports_model || makeInitialFinancialReportsModel(),
     mermaid_code: row.mermaid_code,
     history: row.history,
     status: row.status,
