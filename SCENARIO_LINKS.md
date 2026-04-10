@@ -8,11 +8,13 @@ Username бота: `fineko_processes_bot`.
 Посилання:
 https://t.me/fineko_processes_bot?start=main_process
 
-## Заплановані Сценарії (ще не активні)
-- `sales_process` — продаж і кваліфікація
-- `operations_process` — виконання і виробництво
-- `finance_process` — оплата і закриття
+## 2) Cashflow + P&L статті
+Опис: збір єдиного персоналізованого списку доходів і витрат для обох шаблонів — Cashflow і P&L — на основі вже побудованого бізнес-процесу.
+
+Посилання:
+https://t.me/fineko_processes_bot?start=cashflow_items
 
 ## Примітка
-- Якщо payload відрізняється від `main_process`, бот повідомляє що сценарій у розробці і запускає `main_process`.
+- Сценарій `cashflow_items` запускається тільки після завершення `main_process`, бо використовує збережений `process_model` з блоку 1.
+- На виході сценарій 2 формує JSON для Cashflow + P&L (з `cost_type`, `pl_level` і `pl_structure`).
 - Для коректної обробки голосових потрібен `OPENAI_API_KEY` (Whisper).

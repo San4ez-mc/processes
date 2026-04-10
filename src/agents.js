@@ -1,6 +1,6 @@
 'use strict'
 const { callLLM } = require('./llm')
-const { INTERVIEW_PROMPT, VALIDATOR_PROMPT, MERMAID_PROMPT } = require('./prompts')
+const { INTERVIEW_PROMPT, VALIDATOR_PROMPT, MERMAID_PROMPT, CASHFLOW_PROMPT } = require('./prompts')
 
 /**
  * Витягти JSON process_model з відповіді агента
@@ -9,7 +9,15 @@ const { INTERVIEW_PROMPT, VALIDATOR_PROMPT, MERMAID_PROMPT } = require('./prompt
  * @returns {object|null}
  */
 function extractProcessModel(text) {
-  const strictMatch = text.match(/<process_model>([\s\S]*?)<\/process_model>/i)
+  return extractTaggedJson(text, 'process_model')
+}
+
+function extractCashflowSession(text) {
+  return extractTaggedJson(text, 'cashflow_session')
+}
+
+function extractTaggedJson(text, tagName) {
+  const strictMatch = text.match(new RegExp(`<${tagName}>([\\s\\S]*?)<\/${tagName}>`, 'i'))
   if (strictMatch) {
     try {
       return JSON.parse(strictMatch[1].trim())
@@ -19,10 +27,11 @@ function extractProcessModel(text) {
   }
 
   // Tolerant mode: model block may be truncated and miss closing tag.
-  const openIdx = text.toLowerCase().indexOf('<process_model>')
+  const openTag = `<${tagName}>`
+  const openIdx = text.toLowerCase().indexOf(openTag)
   if (openIdx < 0) return null
 
-  const afterOpen = text.slice(openIdx + '<process_model>'.length)
+  const afterOpen = text.slice(openIdx + openTag.length)
   const startJson = afterOpen.indexOf('{')
   if (startJson < 0) return null
 
@@ -43,20 +52,27 @@ function extractProcessModel(text) {
  * @returns {string}
  */
 function extractBotText(text) {
-  const openTagRegex = /<process_model>/i
-  const closeTagRegex = /<\/process_model>/i
+  return extractBotTextWithoutTag(text, 'process_model')
+}
+
+function extractCashflowText(text) {
+  return extractBotTextWithoutTag(text, 'cashflow_session')
+}
+
+function extractBotTextWithoutTag(text, tagName) {
+  const openTagRegex = new RegExp(`<${tagName}>`, 'i')
+  const closeTagRegex = new RegExp(`<\/${tagName}>`, 'i')
   let sanitized = text
 
-  // Remove full technical block when both tags exist.
-  sanitized = sanitized.replace(/<process_model>[\s\S]*?<\/process_model>/gi, '')
+  sanitized = sanitized.replace(new RegExp(`<${tagName}>[\\s\\S]*?<\/${tagName}>`, 'gi'), '')
 
-  // If the model block is malformed (missing closing tag), drop everything from open tag.
   if (openTagRegex.test(sanitized) && !closeTagRegex.test(sanitized)) {
-    sanitized = sanitized.replace(/<process_model>[\s\S]*/i, '')
+    sanitized = sanitized.replace(new RegExp(`<${tagName}>[\\s\\S]*`, 'i'), '')
   }
 
   return sanitized
     .replace(/###INTERVIEW_COMPLETE###/g, '')
+    .replace(/###CASHFLOW_ITEMS_COMPLETE###/g, '')
     .replace(/```json\s*[\s\S]*?```/gi, '')
     .replace(/```[\s\S]*?```/g, '')
     .trim()
@@ -131,6 +147,27 @@ async function runInterviewStep(session) {
   return { updatedModel, text, isComplete }
 }
 
+async function runCashflowInterviewStep({ processModel, cashflowSession, history, itemsLibrary, teamRoles }) {
+  const systemPrompt = CASHFLOW_PROMPT
+    .replace('{{business_type}}', processModel?.business_type || 'невідомий тип бізнесу')
+    .replace('{{team_size}}', String(processModel?.team_size || 0))
+    .replace('{{team_roles}}', teamRoles || 'не вказано')
+    .replace('{{items_library}}', JSON.stringify(itemsLibrary, null, 2))
+    .replace('{{completed_blocks}}', (cashflowSession?.completed_blocks || []).join(', ') || 'жоден')
+    .replace('{{collected_items}}', JSON.stringify(cashflowSession?.items || {}, null, 2))
+
+  const response = await callLLM({
+    system: systemPrompt,
+    messages: history,
+  })
+
+  const updatedSession = extractCashflowSession(response)
+  const text = extractCashflowText(response)
+  const isComplete = response.includes('###CASHFLOW_ITEMS_COMPLETE###')
+
+  return { updatedSession, text, isComplete }
+}
+
 /**
  * Компонент 2 — Валідатор логіки
  * Перевіряє JSON-модель на повноту і логіку
@@ -183,4 +220,4 @@ async function runMermaidGenerator(processModel) {
   return clean
 }
 
-module.exports = { runInterviewStep, runValidator, runMermaidGenerator }
+module.exports = { runInterviewStep, runCashflowInterviewStep, runValidator, runMermaidGenerator }

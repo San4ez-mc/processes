@@ -49,6 +49,22 @@ function makeInitialProcessModel(sessionId) {
   }
 }
 
+function makeInitialCashflowSession() {
+  return {
+    items: {
+      income: [],
+      cogs: [],
+      team: [],
+      operations: [],
+      taxes: [],
+    },
+    completed_blocks: [],
+    history: [],
+    items_count: 0,
+    status: 'draft',
+  }
+}
+
 /**
  * Отримати сесію або створити нову
  * @param {number} telegramId
@@ -71,10 +87,10 @@ async function getOrCreateSession(telegramId) {
 
   const { rows: newRows } = await pool.query(
     `INSERT INTO sessions
-       (telegram_id, process_model, history, status, validation_attempts, current_block, completed_blocks)
-     VALUES ($1, $2, $3, 'draft', 0, 0, '[]')
+       (telegram_id, current_scenario, process_model, cashflow_session, history, status, validation_attempts, current_block, completed_blocks)
+     VALUES ($1, 'main_process', $2, $3, $4, 'draft', 0, 0, '[]')
      RETURNING *`,
-    [telegramId, JSON.stringify(processModel), JSON.stringify([])]
+    [telegramId, JSON.stringify(processModel), JSON.stringify(makeInitialCashflowSession()), JSON.stringify([])]
   )
 
   return rowToSession(newRows[0])
@@ -87,25 +103,74 @@ async function getOrCreateSession(telegramId) {
 async function saveSession(session) {
   await pool.query(
     `UPDATE sessions SET
-       process_model       = $1,
-       mermaid_code        = $2,
-       history             = $3,
-       status              = $4,
-       validation_attempts = $5,
-       current_block       = $6,
-       completed_blocks    = $7
-     WHERE telegram_id = $8`,
+       current_scenario    = $1,
+       process_model       = $2,
+       cashflow_session    = $3,
+       mermaid_code        = $4,
+       history             = $5,
+       status              = $6,
+       validation_attempts = $7,
+       current_block       = $8,
+       completed_blocks    = $9
+     WHERE telegram_id = $10`,
     [
+      session.current_scenario || 'main_process',
       JSON.stringify(session.process_model),
+      JSON.stringify(session.cashflow_session || makeInitialCashflowSession()),
       session.mermaid_code || null,
-      JSON.stringify(session.history),
+      JSON.stringify(session.history || []),
       session.status,
       session.validation_attempts,
       session.current_block,
-      JSON.stringify(session.completed_blocks),
+      JSON.stringify(session.completed_blocks || []),
       session.telegram_id,
     ]
   )
+}
+
+function buildResetSession(session, scenario) {
+  const next = {
+    ...session,
+    current_scenario: scenario,
+    history: [],
+    status: 'draft',
+    validation_attempts: 0,
+    current_block: 0,
+    completed_blocks: [],
+  }
+
+  if (scenario === 'main_process') {
+    const sessionId = session.process_model?.session_id || session.id
+    next.process_model = makeInitialProcessModel(sessionId)
+    next.cashflow_session = makeInitialCashflowSession()
+    next.mermaid_code = null
+  }
+
+  if (scenario === 'cashflow_items') {
+    next.cashflow_session = makeInitialCashflowSession()
+  }
+
+  return next
+}
+
+async function getSession(telegramId) {
+  const { rows } = await pool.query(
+    'SELECT * FROM sessions WHERE telegram_id = $1',
+    [telegramId]
+  )
+
+  if (rows.length === 0) {
+    return null
+  }
+
+  return rowToSession(rows[0])
+}
+
+async function resetSessionForScenario(telegramId, scenario) {
+  const session = await getOrCreateSession(telegramId)
+  const next = buildResetSession(session, scenario)
+  await saveSession(next)
+  return next
 }
 
 /**
@@ -161,11 +226,22 @@ async function ensureReady({ retries = 8, delayMs = 4000 } = {}) {
   throw new Error(formatDbError(lastErr))
 }
 
+async function close() {
+  try {
+    await pool.end()
+    console.log('[db] Pool closed')
+  } catch (err) {
+    console.error('[db] Pool close error:', formatDbError(err))
+  }
+}
+
 function rowToSession(row) {
   return {
     id: row.id,
     telegram_id: row.telegram_id,
+    current_scenario: row.current_scenario || 'main_process',
     process_model: row.process_model,
+    cashflow_session: row.cashflow_session || makeInitialCashflowSession(),
     mermaid_code: row.mermaid_code,
     history: row.history,
     status: row.status,
@@ -176,10 +252,13 @@ function rowToSession(row) {
 }
 
 module.exports = {
+  getSession,
   getOrCreateSession,
   saveSession,
   deleteSession,
+  resetSessionForScenario,
   runMigration,
   ensureReady,
+  close,
   formatDbError,
 }

@@ -7,13 +7,13 @@ const http = require('http')
 const path = require('path')
 const config = require('./config')
 const db = require('./db')
-const { runInterviewStep, runValidator, runMermaidGenerator } = require('./agents')
+const { runInterviewStep, runCashflowInterviewStep, runValidator, runMermaidGenerator } = require('./agents')
 const { transcribeAudio } = require('./llm')
 const { renderMermaid } = require('./mermaidRender')
 
 // ─── Константи ──────────────────────────────────────────────────────────────
 
-const START_MESSAGE = `Привіт! Зараз ми побудуємо схему вашого бізнес-процесу — від того як клієнт дізнається про вас до моменту коли ви виконали замовлення і отримали оплату.
+const MAIN_START_MESSAGE = `Привіт! Зараз ми побудуємо схему вашого бізнес-процесу — від того як клієнт дізнається про вас до моменту коли ви виконали замовлення і отримали оплату.
 
 Я буду задавати питання по одному. Відповідайте як вам зручно — коротко або детально, я підлаштуюся.
 
@@ -24,7 +24,7 @@ const START_MESSAGE = `Привіт! Зараз ми побудуємо схем
 
 Почнемо? Розкажіть коротко — чим займається ваша компанія?`
 
-const COMPLETION_MESSAGE = `Відмінно! Ось схема бізнес-процесу вашої компанії 👆
+const MAIN_COMPLETION_MESSAGE = `Відмінно! Ось схема бізнес-процесу вашої компанії 👆
 
 Зверніть увагу на ролі в лівій колонці — ми будемо використовувати цю схему на всіх наступних уроках.
 
@@ -33,6 +33,7 @@ const COMPLETION_MESSAGE = `Відмінно! Ось схема бізнес-п�
 const PROFILE_PHOTO_PATH = path.join(__dirname, '..', 'profile.jpg')
 const PORT = Number(process.env.PORT || 3000)
 const SCENARIO_MAIN = 'main_process'
+const SCENARIO_CASHFLOW = 'cashflow_items'
 const MAX_VALIDATION_ATTEMPTS = 3
 const WEBHOOK_PATH = normalizeWebhookPath(config.telegram.webhookPath)
 const WEBHOOK_URL = buildWebhookUrl(config.telegram.webhookBaseUrl, WEBHOOK_PATH)
@@ -53,6 +54,11 @@ async function handleMessage(userId, text) {
   } catch (err) {
     console.error('[bot] DB getOrCreateSession error:', db.formatDbError(err))
     await safeSendMessage(userId, 'Виникла технічна помилка бази даних. Спробуйте /start ще раз.')
+    return
+  }
+
+  if (session.current_scenario === SCENARIO_CASHFLOW) {
+    await handleCashflowMessage(userId, text, session)
     return
   }
 
@@ -195,7 +201,7 @@ ${followUp}`
     } catch (saveErr) {
       console.error('[bot] Save after Mermaid error failed:', saveErr.message)
     }
-    await safeSendMessage(userId, COMPLETION_MESSAGE)
+    await safeSendMessage(userId, MAIN_COMPLETION_MESSAGE)
     await safeSendMessage(userId, '❌ Помилка генерації схеми')
     return
   }
@@ -215,7 +221,7 @@ ${followUp}`
     } catch (saveErr) {
       console.error('[bot] Save after render error failed:', saveErr.message)
     }
-    await safeSendMessage(userId, COMPLETION_MESSAGE)
+    await safeSendMessage(userId, MAIN_COMPLETION_MESSAGE)
     await safeSendMessage(userId, '📊 Схема (текстовим кодом)...')
     return
   }
@@ -245,28 +251,352 @@ ${followUp}`
   console.log(`[bot] User ${userId}: ==================== INTERVIEW FULLY COMPLETE ====================`)
 }
 
+async function handleCashflowMessage(userId, text, session) {
+  if (session.cashflow_session?.status === 'complete' || session.status === 'complete') {
+    await safeSendMessage(userId, 'Список для Cashflow вже зібраний. Надішліть /restart щоб пройти цей сценарій ще раз.')
+    return
+  }
+
+  if (!hasCompletedProcessModel(session.process_model)) {
+    const awaitingFile = Boolean(session.cashflow_session?.awaiting_process_model_file)
+    if (awaitingFile) {
+      await safeSendMessage(userId, 'Щоб не повторювати питання з попереднього чату, надішліть файл process_model.json з результатом сценарію 1.')
+      return
+    }
+
+    await safeSendMessage(userId, 'Не бачу завершеного бізнес-процесу для цього Telegram ID. Надішліть process_model.json, або спочатку пройдіть сценарій 1 у цьому боті.')
+    return
+  }
+
+  const cashflowSession = normalizeCashflowSession(session.cashflow_session)
+  const history = Array.isArray(session.history) ? session.history : []
+  history.push({ role: 'user', content: text })
+  cashflowSession.history.push({ role: 'user', content: text })
+
+  let agentResponse
+  try {
+    await sendChatAction(userId, 'typing')
+    agentResponse = await runCashflowInterviewStep({
+      processModel: session.process_model,
+      cashflowSession,
+      history,
+      itemsLibrary: getItemsLibrary(session.process_model?.business_type),
+      teamRoles: extractTeamRoles(session.process_model),
+    })
+  } catch (err) {
+    console.error('[bot] Cashflow agent error:', err.message)
+    cashflowSession.history.pop()
+    history.pop()
+    session.cashflow_session = cashflowSession
+    session.history = history
+    await db.saveSession(session)
+    await safeSendMessage(userId, 'Не вдалося отримати відповідь від ШІ для Cashflow. Спробуйте ще раз.')
+    return
+  }
+
+  const nextCashflowSession = agentResponse.updatedSession
+    ? normalizeCashflowSession(agentResponse.updatedSession)
+    : cashflowSession
+
+  let botText = agentResponse.text
+  if (!agentResponse.isComplete && (!botText || !botText.trim())) {
+    botText = buildCashflowFallbackQuestion(nextCashflowSession)
+  }
+
+  if (botText) {
+    history.push({ role: 'assistant', content: botText })
+    nextCashflowSession.history.push({ role: 'assistant', content: botText })
+  }
+
+  nextCashflowSession.status = agentResponse.isComplete ? 'complete' : 'in_progress'
+  session.cashflow_session = nextCashflowSession
+  session.history = history
+  session.status = agentResponse.isComplete ? 'complete' : 'draft'
+
+  try {
+    await db.saveSession(session)
+  } catch (err) {
+    console.error('[bot] DB saveSession error:', err.message)
+  }
+
+  if (!agentResponse.isComplete) {
+    if (botText) {
+      await safeSendMessage(userId, botText)
+    }
+    return
+  }
+
+  await safeSendMessage(userId, buildCashflowCompletionMessage(nextCashflowSession))
+  await sendCompletionActions(userId, SCENARIO_CASHFLOW)
+}
+
+function normalizeCashflowSession(cashflowSession) {
+  const items = cashflowSession?.items || {}
+  const normalized = {
+    items: {
+      income: Array.isArray(items.income) ? items.income : [],
+      cogs: Array.isArray(items.cogs) ? items.cogs : [],
+      team: Array.isArray(items.team) ? items.team : [],
+      operations: Array.isArray(items.operations) ? items.operations : [],
+      taxes: Array.isArray(items.taxes) ? items.taxes : [],
+    },
+    completed_blocks: Array.isArray(cashflowSession?.completed_blocks) ? cashflowSession.completed_blocks : [],
+    history: Array.isArray(cashflowSession?.history) ? cashflowSession.history : [],
+    pl_structure: normalizePlStructure(cashflowSession?.pl_structure),
+    awaiting_process_model_file: Boolean(cashflowSession?.awaiting_process_model_file),
+    items_count: 0,
+    status: cashflowSession?.status || 'draft',
+  }
+
+  normalized.items = normalizeCashflowItems(normalized.items)
+
+  normalized.items_count = Object.values(normalized.items).reduce((sum, list) => sum + list.length, 0)
+  normalized.pl_structure = buildPLStructure(normalized.items)
+  return normalized
+}
+
+function normalizeCashflowItems(items) {
+  const applyDefaults = (entry) => {
+    const costType = normalizeCostType(entry?.cost_type, entry?.name)
+    return {
+      id: entry?.id || '',
+      name: entry?.name || '',
+      cost_type: costType,
+      frequency: normalizeFrequency(entry?.frequency),
+      is_regular: typeof entry?.is_regular === 'boolean' ? entry.is_regular : inferRegularFromFrequency(entry?.frequency),
+      pl_level: normalizePlLevel(entry?.pl_level, costType),
+      notes: entry?.notes || '',
+    }
+  }
+
+  return {
+    income: Array.isArray(items.income) ? items.income.map(applyDefaults) : [],
+    cogs: Array.isArray(items.cogs) ? items.cogs.map(applyDefaults) : [],
+    team: Array.isArray(items.team) ? items.team.map(applyDefaults) : [],
+    operations: Array.isArray(items.operations) ? items.operations.map(applyDefaults) : [],
+    taxes: Array.isArray(items.taxes) ? items.taxes.map(applyDefaults) : [],
+  }
+}
+
+function normalizePlStructure(plStructure) {
+  const normalized = plStructure || {}
+  return {
+    revenue: Array.isArray(normalized.revenue) ? normalized.revenue : [],
+    cogs: Array.isArray(normalized.cogs) ? normalized.cogs : [],
+    gross_profit: normalized.gross_profit || 'revenue - cogs',
+    opex: Array.isArray(normalized.opex) ? normalized.opex : [],
+    operating_profit: normalized.operating_profit || 'gross_profit - opex',
+    owner_payout: Array.isArray(normalized.owner_payout) ? normalized.owner_payout : [],
+    pre_tax_profit: normalized.pre_tax_profit || 'operating_profit - owner_payout',
+    taxes: Array.isArray(normalized.taxes) ? normalized.taxes : [],
+    net_profit: normalized.net_profit || 'pre_tax_profit - taxes',
+  }
+}
+
+function normalizeFrequency(value) {
+  const allowed = new Set(['monthly', 'quarterly', 'annual', 'project_based', 'irregular'])
+  const normalized = String(value || '').trim().toLowerCase()
+  if (allowed.has(normalized)) return normalized
+  return 'monthly'
+}
+
+function inferRegularFromFrequency(value) {
+  const frequency = normalizeFrequency(value)
+  return frequency === 'monthly' || frequency === 'quarterly' || frequency === 'annual'
+}
+
+function normalizeCostType(value, name = '') {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (['income', 'cogs', 'opex', 'owner', 'tax'].includes(normalized)) {
+    return normalized
+  }
+
+  const lowerName = String(name || '').toLowerCase()
+  if (/(подат|єсв|пдв|коміс|еквайринг|bank)/.test(lowerName)) return 'tax'
+  if (/(власник|дивіденд|owner)/.test(lowerName)) return 'owner'
+  return 'opex'
+}
+
+function normalizePlLevel(value, costType) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (['revenue', 'gross_profit', 'operating_profit', 'pre_tax_profit', 'net_profit'].includes(normalized)) {
+    return normalized
+  }
+
+  if (costType === 'income') return 'revenue'
+  if (costType === 'cogs') return 'gross_profit'
+  if (costType === 'owner') return 'pre_tax_profit'
+  if (costType === 'tax') return 'net_profit'
+  return 'operating_profit'
+}
+
+function buildPLStructure(items) {
+  const allItems = [
+    ...(items.income || []),
+    ...(items.cogs || []),
+    ...(items.team || []),
+    ...(items.operations || []),
+    ...(items.taxes || []),
+  ]
+
+  const idsByCostType = (costType) => allItems.filter((item) => item.cost_type === costType).map((item) => item.id).filter(Boolean)
+
+  return {
+    revenue: idsByCostType('income'),
+    cogs: idsByCostType('cogs'),
+    gross_profit: 'revenue - cogs',
+    opex: idsByCostType('opex'),
+    operating_profit: 'gross_profit - opex',
+    owner_payout: idsByCostType('owner'),
+    pre_tax_profit: 'operating_profit - owner_payout',
+    taxes: idsByCostType('tax'),
+    net_profit: 'pre_tax_profit - taxes',
+  }
+}
+
+function getItemsLibrary(rawBusinessType) {
+  const businessType = normalizeBusinessType(rawBusinessType)
+  const libraries = {
+    послуги: {
+      income: ['Послуги (основні)', 'Проєктна робота', 'Ретейнер / абонплата', 'Навчання і воркшопи'],
+      cogs: ['Підрядники на проєкти', 'Ліцензії і матеріали для проєктів'],
+      opex: ['Зарплати команди', 'Реклама і маркетинг', 'CRM і ПЗ', 'Зв\'язок', 'Оренда офісу / коворкінг'],
+      taxes: ['Єдиний податок', 'ЄСВ', 'Банківське обслуговування'],
+      always_present: [
+        { name: 'Виплата власнику', cost_type: 'owner' },
+        { name: 'Мобільний зв\'язок', cost_type: 'opex' },
+        { name: 'Підписки на ПЗ', cost_type: 'opex' },
+        { name: 'Банківські комісії', cost_type: 'tax' },
+      ],
+    },
+    торгівля: {
+      income: ['Продаж товарів (роздріб)', 'Продаж товарів (опт)', 'Доставка (якщо платна)'],
+      cogs: ['Закупівля товару', 'Логістика і доставка', 'Митні платежі', 'Складські витрати'],
+      opex: ['Зарплати команди', 'Оренда точки / складу', 'Реклама і маркетинг', 'Еквайринг', 'Пакування і матеріали'],
+      taxes: ['Єдиний податок / ПДВ', 'ЄСВ', 'Банківське обслуговування'],
+      always_present: [
+        { name: 'Виплата власнику', cost_type: 'owner' },
+        { name: 'Мобільний зв\'язок', cost_type: 'opex' },
+        { name: 'Підписки на ПЗ', cost_type: 'opex' },
+        { name: 'Банківські комісії', cost_type: 'tax' },
+      ],
+    },
+    виробництво: {
+      income: ['Продаж продукції', 'Оптові замовлення', 'Виробництво на замовлення'],
+      cogs: ['Сировина і матеріали', 'Пакування', 'Логістика і доставка', 'Виробничі комунальні'],
+      opex: ['Зарплати офісу і управління', 'Оренда виробництва', 'Обслуговування обладнання'],
+      taxes: ['Податок на прибуток / єдиний податок', 'ЄСВ', 'Банківське обслуговування'],
+      always_present: [
+        { name: 'Виплата власнику', cost_type: 'owner' },
+        { name: 'Мобільний зв\'язок', cost_type: 'opex' },
+        { name: 'Підписки на ПЗ', cost_type: 'opex' },
+        { name: 'Банківські комісії', cost_type: 'tax' },
+      ],
+    },
+  }
+
+  return libraries[businessType] || libraries.послуги
+}
+
+function normalizeBusinessType(rawBusinessType) {
+  const value = String(rawBusinessType || '').toLowerCase()
+  if (/(вироб|цех|фабрик|майстерн)/.test(value)) return 'виробництво'
+  if (/(торг|магаз|e-commerce|ecommerce|роздр|опт|товар)/.test(value)) return 'торгівля'
+  return 'послуги'
+}
+
+function extractTeamRoles(processModel) {
+  const lanes = Array.isArray(processModel?.lanes) ? processModel.lanes : []
+  const roles = lanes
+    .map((lane) => [lane.role, lane.responsible].filter(Boolean).join(' — '))
+    .filter(Boolean)
+
+  return roles.length > 0 ? roles.join(', ') : 'не вказано'
+}
+
+function buildCashflowFallbackQuestion(cashflowSession) {
+  const completed = new Set(cashflowSession.completed_blocks || [])
+  if (!completed.has('A')) return 'Я вже підготував базові джерела доходів. Що з цього у вас є, а що треба прибрати або додати?'
+  if (!completed.has('B')) return 'Тепер зберемо прямі витрати під конкретні замовлення. Що з цього у вас виникає тільки коли є замовлення?'
+  if (!completed.has('C')) return 'Тепер уточнимо витрати на команду. Які регулярні виплати людям у вас є?'
+  if (!completed.has('D')) return 'Добре. Тепер пройдемося по витратах, які є щомісяця незалежно від кількості клієнтів. Що додамо?'
+  if (!completed.has('E')) return 'Залишилося перевірити податки, банківські комісії та можливі кредити. Що з цього є у вас?'
+  return 'Я зібрав основу для Cashflow і P&L. Перевірте, будь ласка, чи нічого не пропустили, і підтвердьте підсумок.'
+}
+
+function buildCashflowCompletionMessage(cashflowSession) {
+  const byType = groupItemsByCostType(cashflowSession.items)
+  const toLine = (title, list) => `${title}: ${list.length ? list.map((item) => item.name).join(', ') : '—'}`
+  const lines = [
+    'Чудово! Ось як виглядає ваш P&L на основі зібраних позицій:',
+    '',
+    `💰 ${toLine('ДОХОДИ', byType.income)}`,
+    `— ${toLine('Прямі витрати', byType.cogs)}`,
+    '= ВАЛОВИЙ ПРИБУТОК',
+    '',
+    `— ${toLine('Витрати бізнесу', byType.opex)}`,
+    '= ОПЕРАЦІЙНИЙ ПРИБУТОК',
+    '',
+    `— ${toLine('Виплата власнику', byType.owner)}`,
+    '= ПРИБУТОК ДО ПОДАТКІВ',
+    '',
+    `— ${toLine('Податки', byType.tax)}`,
+    '= ЧИСТИЙ ПРИБУТОК',
+    '',
+    `Всього ${cashflowSession.items_count} позицій. Цей набір використовується одночасно для Cashflow і P&L.`,
+  ]
+  return lines.join('\n')
+}
+
+function groupItemsByCostType(items) {
+  const allItems = [
+    ...(items.income || []),
+    ...(items.cogs || []),
+    ...(items.team || []),
+    ...(items.operations || []),
+    ...(items.taxes || []),
+  ]
+
+  return {
+    income: allItems.filter((item) => item.cost_type === 'income'),
+    cogs: allItems.filter((item) => item.cost_type === 'cogs'),
+    opex: allItems.filter((item) => item.cost_type === 'opex'),
+    owner: allItems.filter((item) => item.cost_type === 'owner'),
+    tax: allItems.filter((item) => item.cost_type === 'tax'),
+  }
+}
+
 // ─── Команди ─────────────────────────────────────────────────────────────────
 
 bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
   const userId = msg.chat.id
-  const payload = (match?.[1] || '').trim().toLowerCase() || SCENARIO_MAIN
+  const payload = normalizeScenario((match?.[1] || '').trim().toLowerCase())
   await launchScenario(userId, payload)
 })
 
 bot.onText(/\/restart/, async (msg) => {
   const userId = msg.chat.id
-  await launchScenario(userId, SCENARIO_MAIN)
+  const session = await db.getOrCreateSession(userId)
+  await launchScenario(userId, session.current_scenario || SCENARIO_MAIN)
 })
 
 bot.onText(/\/status/, async (msg) => {
   const userId = msg.chat.id
   try {
     const session = await db.getOrCreateSession(userId)
+    const status = session.status === 'complete' ? '✅ Завершено' : '🔄 В процесі'
+    if (session.current_scenario === SCENARIO_CASHFLOW) {
+      const cashflowSession = normalizeCashflowSession(session.cashflow_session)
+      await safeSendMessage(userId,
+        `📋 Статус вашої сесії:\n• Сценарій: Cashflow + P&L\n• Статус: ${status}\n• Зібрано позицій: ${cashflowSession.items_count}\n• Завершено блоків: ${cashflowSession.completed_blocks.length}/5`
+      )
+      return
+    }
+
     const lanes = session.process_model?.lanes?.length || 0
     const nodes = (session.process_model?.lanes || []).reduce((s, l) => s + (l.nodes?.length || 0), 0)
-    const status = session.status === 'complete' ? '✅ Завершено' : '🔄 В процесі'
     await safeSendMessage(userId,
-      `📋 Статус вашої сесії:\n• Статус: ${status}\n• Ролей (swimlanes): ${lanes}\n• Кроків (вузлів): ${nodes}\n• Блок: ${session.current_block}/5`
+      `📋 Статус вашої сесії:\n• Сценарій: Основний бізнес-процес\n• Статус: ${status}\n• Ролей (swimlanes): ${lanes}\n• Кроків (вузлів): ${nodes}\n• Блок: ${session.current_block}/5`
     )
   } catch (err) {
     console.error('[bot] /status error:', err.message)
@@ -302,15 +632,34 @@ bot.on('callback_query', async (query) => {
     if (action === 'action_restart') {
       console.log(`[bot] User ${userId}: Clicked restart button`)
       await bot.answerCallbackQuery(query.id, { text: '🔄 Прискорінюючи...' })
-      await launchScenario(userId, SCENARIO_MAIN)
-    } else if (action === 'action_download') {
+      const session = await db.getOrCreateSession(userId)
+      await launchScenario(userId, session.current_scenario || SCENARIO_MAIN)
+    } else if (action === 'action_download' || action === 'action_download_process' || action === 'action_download_cashflow') {
       console.log(`[bot] User ${userId}: Clicked download button`)
       const session = await db.getOrCreateSession(userId)
-      if (session.mermaid_code && session.process_model?.mermaid_code) {
+      if (action === 'action_download_cashflow') {
+        const cashflowSession = normalizeCashflowSession(session.cashflow_session)
+        if (cashflowSession.items_count > 0) {
+          await bot.answerCallbackQuery(query.id, { text: '📑 Готово...' })
+          await sendCashflowFiles(userId, session)
+        } else {
+          await bot.answerCallbackQuery(query.id, { text: '❌ Cashflow ще не готовий', show_alert: true })
+        }
+      } else if (action === 'action_download_process') {
+        if (session.mermaid_code && session.process_model?.mermaid_code) {
+          await bot.answerCallbackQuery(query.id, { text: '📑 Готово...' })
+          await sendProcessFiles(userId, session)
+        } else {
+          await bot.answerCallbackQuery(query.id, { text: '❌ Схема ще не готова', show_alert: true })
+        }
+      } else if (session.current_scenario === SCENARIO_CASHFLOW && session.cashflow_session?.items_count > 0) {
+        await bot.answerCallbackQuery(query.id, { text: '📑 Готово...' })
+        await sendCashflowFiles(userId, session)
+      } else if (session.mermaid_code && session.process_model?.mermaid_code) {
         await bot.answerCallbackQuery(query.id, { text: '📑 Готово...' })
         await sendProcessFiles(userId, session)
       } else {
-        await bot.answerCallbackQuery(query.id, { text: '❌ Схема не готова', show_alert: true })
+        await bot.answerCallbackQuery(query.id, { text: '❌ Файл ще не готовий', show_alert: true })
       }
     }
   } catch (err) {
@@ -365,6 +714,12 @@ bot.on('document', async (msg) => {
     await safeSendMessage(userId, '📄 Читаю документ...')
     const fileBuffer = await downloadTelegramFile(fileId)
     console.log(`[bot] User ${userId}: Document meta: mime=${mimeType || 'n/a'}, size=${fileBuffer.length}`)
+
+    const importedProcessModel = await tryImportProcessModelFromDocument(userId, fileBuffer, fileName, mimeType)
+    if (importedProcessModel) {
+      return
+    }
+
     const extractedText = await extractTextFromDocument(fileBuffer, fileName, mimeType)
 
     if (!extractedText) {
@@ -426,8 +781,13 @@ async function sendChatAction(userId, action = 'typing') {
   }
 }
 
-async function sendCompletionActions(userId) {
-  const text = `${COMPLETION_MESSAGE}\n\nОберіть дію нижче:`
+async function sendCompletionActions(userId, scenario = SCENARIO_MAIN) {
+  const isCashflow = scenario === SCENARIO_CASHFLOW
+  const text = isCashflow
+    ? 'Сценарій Cashflow + P&L завершено. Оберіть дію нижче:'
+    : `${MAIN_COMPLETION_MESSAGE}\n\nОберіть дію нижче:`
+  const downloadLabel = isCashflow ? 'Отримати Cashflow + P&L JSON' : 'Отримати опис процесу'
+  const downloadAction = isCashflow ? 'action_download_cashflow' : 'action_download_process'
   try {
     await bot.sendMessage(userId, text, {
       parse_mode: 'Markdown',
@@ -435,7 +795,7 @@ async function sendCompletionActions(userId) {
         inline_keyboard: [
           [
             { text: 'Повернутись і відредагувати ще щось', callback_data: 'action_restart' },
-            { text: 'Отримати опис процесу', callback_data: 'action_download' },
+            { text: downloadLabel, callback_data: downloadAction },
           ],
         ],
       },
@@ -447,7 +807,7 @@ async function sendCompletionActions(userId) {
         inline_keyboard: [
           [
             { text: 'Повернутись і відредагувати ще щось', callback_data: 'action_restart' },
-            { text: 'Отримати опис процесу', callback_data: 'action_download' },
+            { text: downloadLabel, callback_data: downloadAction },
           ],
         ],
       },
@@ -487,6 +847,27 @@ async function sendProcessFiles(userId, session) {
   )
 }
 
+async function sendCashflowFiles(userId, session) {
+  const cashflowSession = normalizeCashflowSession(session.cashflow_session)
+  const payload = {
+    session_id: session.process_model?.session_id || session.id,
+    business_type: session.process_model?.business_type || '',
+    cashflow_items: cashflowSession.items,
+    pl_structure: cashflowSession.pl_structure,
+    status: cashflowSession.status,
+    items_count: cashflowSession.items_count,
+  }
+
+  const jsonBuffer = Buffer.from(JSON.stringify(payload, null, 2), 'utf8')
+  await sendChatAction(userId, 'upload_document')
+  await bot.sendDocument(
+    userId,
+    jsonBuffer,
+    { caption: 'Файл: персоналізовані Cashflow + P&L (JSON)' },
+    { filename: 'cashflow_pl_items.json', contentType: 'application/json' }
+  )
+}
+
 function splitMessageChunks(text, maxLen = 3500) {
   if (!text) return ['']
   if (text.length <= maxLen) return [text]
@@ -508,14 +889,35 @@ function splitMessageChunks(text, maxLen = 3500) {
   return parts
 }
 
-async function launchScenario(userId, payload) {
-  const requestedScenario = payload || SCENARIO_MAIN
+function normalizeScenario(payload) {
+  return payload === SCENARIO_CASHFLOW ? SCENARIO_CASHFLOW : SCENARIO_MAIN
+}
 
-  try {
-    await db.deleteSession(userId)
-  } catch (err) {
-    console.error('[bot] deleteSession error:', db.formatDbError(err))
-  }
+function buildCashflowStartMessage(processModel) {
+  const businessType = processModel?.business_type || 'ваш бізнес'
+  const teamSize = processModel?.team_size || 0
+  return `Тепер зберемо всі доходи і витрати.
+
+Я вже знаю, що у вас ${businessType} і команда ${teamSize} ${pluralizePeople(teamSize)}.
+Буду пропонувати готові варіанти, а ви підтвердите або підкоригуєте.
+
+Важливий момент: ці дані ми збираємо один раз, і вони підуть і в Cashflow, і в P&L.
+Тому для частини витрат уточню одне просте питання.
+
+Займе 7-10 хвилин. Поїхали?
+
+Почнемо. Які з базових джерел доходу у вас точно є?`
+}
+
+function pluralizePeople(count) {
+  if (count % 10 === 1 && count % 100 !== 11) return 'людина'
+  if ([2, 3, 4].includes(count % 10) && ![12, 13, 14].includes(count % 100)) return 'людини'
+  return 'людей'
+}
+
+async function launchScenario(userId, payload) {
+  const requestedScenario = normalizeScenario(payload)
+  const session = await db.getOrCreateSession(userId)
 
   // Відправляємо профіль-фото без підпису
   try {
@@ -524,11 +926,32 @@ async function launchScenario(userId, payload) {
     console.warn('[bot] Failed to send profile photo:', err.message)
   }
 
-  if (requestedScenario !== SCENARIO_MAIN) {
-    await safeSendMessage(userId, 'Цей сценарій ще в розробці. Поки доступний тільки основний бізнес-процес.')
+  if (requestedScenario === SCENARIO_CASHFLOW) {
+    if (!hasCompletedProcessModel(session.process_model)) {
+      const nextSession = await db.resetSessionForScenario(userId, SCENARIO_CASHFLOW)
+      const nextCashflowSession = normalizeCashflowSession(nextSession.cashflow_session)
+      nextCashflowSession.awaiting_process_model_file = true
+      nextSession.cashflow_session = nextCashflowSession
+      await db.saveSession(nextSession)
+
+      await safeSendMessage(userId, `Для сценарію 2 потрібен файл бізнес-процесу саме для цього Telegram ID.
+
+Якщо сценарій 1 вже проходили в іншому чаті, надішліть сюди файл process_model.json.
+Після імпорту одразу запущу Cashflow + P&L без повторних питань.`)
+      return
+    }
+
+    const nextSession = await db.resetSessionForScenario(userId, SCENARIO_CASHFLOW)
+    const nextCashflowSession = normalizeCashflowSession(nextSession.cashflow_session)
+    nextCashflowSession.awaiting_process_model_file = false
+    nextSession.cashflow_session = nextCashflowSession
+    await db.saveSession(nextSession)
+    await safeSendMessage(userId, buildCashflowStartMessage(session.process_model))
+    return
   }
 
-  await safeSendMessage(userId, START_MESSAGE)
+  await db.resetSessionForScenario(userId, SCENARIO_MAIN)
+  await safeSendMessage(userId, MAIN_START_MESSAGE)
 }
 
 async function downloadTelegramFile(fileId) {
@@ -583,6 +1006,63 @@ async function extractTextFromDocument(fileBuffer, fileName = '', mimeType = '')
   }
 
   return ''
+}
+
+async function tryImportProcessModelFromDocument(userId, fileBuffer, fileName, mimeType) {
+  const ext = path.extname(fileName || '').toLowerCase()
+  const isJsonLike = ext === '.json' || mimeType === 'application/json' || /process_model/i.test(fileName || '')
+  if (!isJsonLike) {
+    return false
+  }
+
+  const text = decodeTextBuffer(fileBuffer).trim()
+  if (!text) {
+    return false
+  }
+
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return false
+  }
+
+  const model = (parsed && typeof parsed === 'object' && parsed.process_model) ? parsed.process_model : parsed
+  if (!isProcessModelShape(model)) {
+    return false
+  }
+
+  const session = await db.getOrCreateSession(userId)
+  const normalizedModel = {
+    ...model,
+    status: 'complete',
+  }
+
+  session.process_model = normalizedModel
+  session.current_scenario = SCENARIO_CASHFLOW
+  session.status = 'draft'
+  if (typeof normalizedModel.mermaid_code === 'string' && normalizedModel.mermaid_code.trim()) {
+    session.mermaid_code = normalizedModel.mermaid_code
+  }
+
+  const cashflowSession = normalizeCashflowSession(session.cashflow_session)
+  cashflowSession.awaiting_process_model_file = false
+  session.cashflow_session = cashflowSession
+
+  await db.saveSession(session)
+
+  await safeSendMessage(userId, 'Отримав файл бізнес-процесу і закріпив його за вашим Telegram ID. Запускаю сценарій Cashflow + P&L.')
+  await safeSendMessage(userId, buildCashflowStartMessage(normalizedModel))
+  return true
+}
+
+function isProcessModelShape(value) {
+  if (!value || typeof value !== 'object') return false
+  return Array.isArray(value.lanes) && Array.isArray(value.edges)
+}
+
+function hasCompletedProcessModel(processModel) {
+  return Boolean(processModel && processModel.status === 'complete' && Array.isArray(processModel.lanes))
 }
 
 function decodeTextBuffer(fileBuffer) {
