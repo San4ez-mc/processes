@@ -1,6 +1,12 @@
 'use strict'
 const { callLLM } = require('./llm')
-const { INTERVIEW_PROMPT, VALIDATOR_PROMPT, MERMAID_PROMPT, CASHFLOW_PROMPT } = require('./prompts')
+const {
+  INTERVIEW_PROMPT,
+  VALIDATOR_PROMPT,
+  MERMAID_PROMPT,
+  CASHFLOW_PROMPT,
+  FINANCIAL_MECHANICS_PROMPT,
+} = require('./prompts')
 
 /**
  * Витягти JSON process_model з відповіді агента
@@ -14,6 +20,10 @@ function extractProcessModel(text) {
 
 function extractCashflowSession(text) {
   return extractTaggedJson(text, 'cashflow_session')
+}
+
+function extractFinancialMechanicsSession(text) {
+  return extractTaggedJson(text, 'financial_mechanics_session')
 }
 
 function extractTaggedJson(text, tagName) {
@@ -57,6 +67,10 @@ function extractBotText(text) {
 
 function extractCashflowText(text) {
   return extractBotTextWithoutTag(text, 'cashflow_session')
+}
+
+function extractFinancialMechanicsText(text) {
+  return extractBotTextWithoutTag(text, 'financial_mechanics_session')
 }
 
 function extractBotTextWithoutTag(text, tagName) {
@@ -168,6 +182,24 @@ async function runCashflowInterviewStep({ processModel, cashflowSession, history
   return { updatedSession, text, isComplete }
 }
 
+async function runFinancialMechanicsInterviewStep({ processModel, cashflowSession, financialMechanicsSession, history, plArticlesContext }) {
+  const systemPrompt = FINANCIAL_MECHANICS_PROMPT
+    .replace('{{business_process_context}}', JSON.stringify(processModel || {}, null, 2))
+    .replace('{{pl_articles_context}}', plArticlesContext || JSON.stringify(cashflowSession?.items || {}, null, 2))
+    .replace('{{financial_mechanics_session_json}}', JSON.stringify(financialMechanicsSession || {}, null, 2))
+
+  const response = await callLLM({
+    system: systemPrompt,
+    messages: history,
+  })
+
+  const updatedSession = extractFinancialMechanicsSession(response)
+  const text = extractFinancialMechanicsText(response)
+  const isComplete = response.includes('###FINANCIAL_MECHANICS_COMPLETE###')
+
+  return { updatedSession, text, isComplete }
+}
+
 /**
  * Компонент 2 — Валідатор логіки
  * Перевіряє JSON-модель на повноту і логіку
@@ -220,4 +252,10 @@ async function runMermaidGenerator(processModel) {
   return clean
 }
 
-module.exports = { runInterviewStep, runCashflowInterviewStep, runValidator, runMermaidGenerator }
+module.exports = {
+  runInterviewStep,
+  runCashflowInterviewStep,
+  runFinancialMechanicsInterviewStep,
+  runValidator,
+  runMermaidGenerator,
+}

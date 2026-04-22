@@ -92,6 +92,72 @@ function makeInitialFinancialReportsModel() {
   }
 }
 
+function makeInitialFinancialMechanicsSession() {
+  return {
+    status: 'draft',
+    current_block: 'A',
+    completed_blocks: [],
+    skips: { E: false, F: false },
+    awaiting_context_files: false,
+    pending_context_files: [],
+    imported_documents: {
+      cashflow_articles: '',
+      pl_articles: '',
+      business_process_raw: '',
+    },
+    salary_payouts: {
+      period: '',
+      structure: '',
+      bonuses: '',
+      contractors: '',
+    },
+    owner_payouts: {
+      method: '',
+      frequency: '',
+      partners: '',
+      market_owner_salary: '',
+    },
+    prepayments: {
+      from_clients: '',
+      to_contractors: '',
+      average_gap_days: '',
+    },
+    projects: {
+      project_pl_required: '',
+      active_directions_count: '',
+      shared_cost_method: '',
+    },
+    inventory: {
+      has_inventory: '',
+      procurement_model: '',
+      average_storage_days: '',
+    },
+    loans: {
+      has_liabilities: '',
+      monthly_payment: '',
+      interest_rate: '',
+      investors_terms: '',
+    },
+    one_off_expenses: {
+      has_assets: '',
+      assets_list: '',
+      planned_big_expenses: '',
+    },
+    recommended_pl_method: '',
+    last_diagnosis_at: '',
+    history: [],
+  }
+}
+
+function makeInitialFinancialMechanicsModel() {
+  return {
+    business_type: '',
+    diagnosis_date: '',
+    markdown: '',
+    status: 'draft',
+  }
+}
+
 /**
  * Отримати сесію або створити нову
  * @param {number} telegramId
@@ -114,10 +180,18 @@ async function getOrCreateSession(telegramId) {
 
   const { rows: newRows } = await pool.query(
     `INSERT INTO sessions
-       (telegram_id, current_scenario, process_model, cashflow_session, financial_reports_model, history, status, validation_attempts, current_block, completed_blocks)
-     VALUES ($1, 'main_process', $2, $3, $4, $5, 'draft', 0, 0, '[]')
+       (telegram_id, current_scenario, process_model, cashflow_session, financial_reports_model, financial_mechanics_session, financial_mechanics_model, history, status, validation_attempts, current_block, completed_blocks)
+     VALUES ($1, 'main_process', $2, $3, $4, $5, $6, $7, 'draft', 0, 0, '[]')
      RETURNING *`,
-    [telegramId, JSON.stringify(processModel), JSON.stringify(makeInitialCashflowSession()), JSON.stringify(makeInitialFinancialReportsModel()), JSON.stringify([])]
+    [
+      telegramId,
+      JSON.stringify(processModel),
+      JSON.stringify(makeInitialCashflowSession()),
+      JSON.stringify(makeInitialFinancialReportsModel()),
+      JSON.stringify(makeInitialFinancialMechanicsSession()),
+      JSON.stringify(makeInitialFinancialMechanicsModel()),
+      JSON.stringify([]),
+    ]
   )
 
   return rowToSession(newRows[0])
@@ -134,18 +208,22 @@ async function saveSession(session) {
        process_model       = $2,
        cashflow_session    = $3,
        financial_reports_model = $4,
-       mermaid_code        = $5,
-       history             = $6,
-       status              = $7,
-       validation_attempts = $8,
-       current_block       = $9,
-       completed_blocks    = $10
-     WHERE telegram_id = $11`,
+       financial_mechanics_session = $5,
+       financial_mechanics_model = $6,
+       mermaid_code        = $7,
+       history             = $8,
+       status              = $9,
+       validation_attempts = $10,
+       current_block       = $11,
+       completed_blocks    = $12
+     WHERE telegram_id = $13`,
     [
       session.current_scenario || 'main_process',
       JSON.stringify(session.process_model),
       JSON.stringify(session.cashflow_session || makeInitialCashflowSession()),
       JSON.stringify(session.financial_reports_model || makeInitialFinancialReportsModel()),
+      JSON.stringify(session.financial_mechanics_session || makeInitialFinancialMechanicsSession()),
+      JSON.stringify(session.financial_mechanics_model || makeInitialFinancialMechanicsModel()),
       session.mermaid_code || null,
       JSON.stringify(session.history || []),
       session.status,
@@ -178,6 +256,11 @@ function buildResetSession(session, scenario) {
 
   if (scenario === 'cashflow_items') {
     next.cashflow_session = makeInitialCashflowSession()
+  }
+
+  if (scenario === 'financial_mechanics_diagnosis') {
+    next.financial_mechanics_session = makeInitialFinancialMechanicsSession()
+    next.financial_mechanics_model = makeInitialFinancialMechanicsModel()
   }
 
   return next
@@ -273,6 +356,8 @@ function rowToSession(row) {
     process_model: row.process_model,
     cashflow_session: row.cashflow_session || makeInitialCashflowSession(),
     financial_reports_model: row.financial_reports_model || makeInitialFinancialReportsModel(),
+    financial_mechanics_session: row.financial_mechanics_session || makeInitialFinancialMechanicsSession(),
+    financial_mechanics_model: row.financial_mechanics_model || makeInitialFinancialMechanicsModel(),
     mermaid_code: row.mermaid_code,
     history: row.history,
     status: row.status,

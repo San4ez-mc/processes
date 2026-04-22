@@ -8,7 +8,13 @@ const fs = require('fs')
 const path = require('path')
 const config = require('./config')
 const db = require('./db')
-const { runInterviewStep, runCashflowInterviewStep, runValidator, runMermaidGenerator } = require('./agents')
+const {
+  runInterviewStep,
+  runCashflowInterviewStep,
+  runFinancialMechanicsInterviewStep,
+  runValidator,
+  runMermaidGenerator,
+} = require('./agents')
 const { transcribeAudio } = require('./llm')
 const { renderMermaid } = require('./mermaidRender')
 
@@ -37,6 +43,7 @@ const PL_INSTRUCTION_DOC_PATH = path.join(__dirname, '..', 'docs', 'instructions
 const PORT = Number(process.env.PORT || 3000)
 const SCENARIO_MAIN = 'main_process'
 const SCENARIO_CASHFLOW = 'cashflow_items'
+const SCENARIO_FINANCIAL_MECHANICS = 'financial_mechanics_diagnosis'
 const MAX_VALIDATION_ATTEMPTS = 3
 const WEBHOOK_PATH = normalizeWebhookPath(config.telegram.webhookPath)
 const WEBHOOK_URL = buildWebhookUrl(config.telegram.webhookBaseUrl, WEBHOOK_PATH)
@@ -62,6 +69,11 @@ async function handleMessage(userId, text) {
 
   if (session.current_scenario === SCENARIO_CASHFLOW) {
     await handleCashflowMessage(userId, text, session)
+    return
+  }
+
+  if (session.current_scenario === SCENARIO_FINANCIAL_MECHANICS) {
+    await handleFinancialMechanicsMessage(userId, text, session)
     return
   }
 
@@ -332,6 +344,293 @@ async function handleCashflowMessage(userId, text, session) {
 
   await safeSendMessage(userId, buildCashflowCompletionMessage(nextCashflowSession))
   await sendCompletionActions(userId, SCENARIO_CASHFLOW)
+}
+
+async function handleFinancialMechanicsMessage(userId, text, session) {
+  const financialSession = normalizeFinancialMechanicsSession(session.financial_mechanics_session)
+
+  if (!hasFinancialMechanicsContext(session, financialSession)) {
+    financialSession.awaiting_context_files = true
+    session.financial_mechanics_session = financialSession
+    await db.saveSession(session)
+    await safeSendMessage(userId, buildFinancialMechanicsContextRequestMessage())
+    return
+  }
+
+  financialSession.awaiting_context_files = false
+  session.financial_mechanics_session = financialSession
+
+  const history = Array.isArray(session.history) ? session.history : []
+  history.push({ role: 'user', content: text })
+  financialSession.history.push({ role: 'user', content: text })
+
+  let agentResponse
+  try {
+    await sendChatAction(userId, 'typing')
+    agentResponse = await runFinancialMechanicsInterviewStep({
+      processModel: session.process_model,
+      cashflowSession: session.cashflow_session,
+      financialMechanicsSession: financialSession,
+      history,
+      plArticlesContext: buildPlArticlesContext(session, financialSession),
+    })
+  } catch (err) {
+    console.error('[bot] Financial mechanics agent error:', err.message)
+    history.pop()
+    financialSession.history.pop()
+    session.financial_mechanics_session = financialSession
+    session.history = history
+    await db.saveSession(session)
+    await safeSendMessage(userId, 'Не вдалося отримати відповідь від ШІ для діагностики. Спробуйте ще раз.')
+    return
+  }
+
+  const nextFinancialSession = agentResponse.updatedSession
+    ? normalizeFinancialMechanicsSession(agentResponse.updatedSession)
+    : financialSession
+
+  let botText = agentResponse.text
+  if (!agentResponse.isComplete && (!botText || !botText.trim())) {
+    botText = buildFinancialMechanicsFallbackQuestion(nextFinancialSession)
+  }
+
+  if (botText) {
+    history.push({ role: 'assistant', content: botText })
+    nextFinancialSession.history.push({ role: 'assistant', content: botText })
+  }
+
+  nextFinancialSession.status = agentResponse.isComplete ? 'complete' : 'in_progress'
+  session.financial_mechanics_session = nextFinancialSession
+  session.history = history
+  session.current_scenario = SCENARIO_FINANCIAL_MECHANICS
+
+  if (!agentResponse.isComplete) {
+    session.status = 'draft'
+    await db.saveSession(session)
+    if (botText) {
+      await safeSendMessage(userId, botText)
+    }
+    return
+  }
+
+  const markdown = buildFinancialMechanicsDocument(session, nextFinancialSession)
+  const missingBlocks = getMissingFinancialMechanicsSections(nextFinancialSession)
+  if (missingBlocks.length > 0) {
+    session.status = 'draft'
+    nextFinancialSession.status = 'in_progress'
+    await db.saveSession(session)
+    await safeSendMessage(userId, `Блок ${missingBlocks[0]} не заповнений. Хочеш повернутись і уточнити?`)
+    return
+  }
+
+  const diagnosisDate = new Date().toISOString()
+  session.financial_mechanics_model = {
+    business_type: session.process_model?.business_type || 'не вказано',
+    diagnosis_date: diagnosisDate,
+    markdown,
+    status: 'complete',
+  }
+  nextFinancialSession.last_diagnosis_at = diagnosisDate
+  nextFinancialSession.status = 'complete'
+  session.status = 'complete'
+
+  await db.saveSession(session)
+
+  await safeSendMessage(userId, `✅ Діагностика завершена.
+
+Я зберіг опис фінансової механіки твого бізнесу у файл financial_mechanics.md.
+
+Що далі:
+— Цей файл буде використаний у блоці 4 для побудови регламенту і інструкцій команді
+— Якщо щось змінилось — можеш пройти діагностику повторно`)
+
+  await sendFinancialMechanicsFile(userId, session)
+  await sendCompletionActions(userId, SCENARIO_FINANCIAL_MECHANICS)
+}
+
+function normalizeFinancialMechanicsSession(financialMechanicsSession) {
+  const normalized = financialMechanicsSession || {}
+  return {
+    status: normalized.status || 'draft',
+    current_block: normalized.current_block || 'A',
+    completed_blocks: Array.isArray(normalized.completed_blocks) ? normalized.completed_blocks : [],
+    skips: {
+      E: Boolean(normalized?.skips?.E),
+      F: Boolean(normalized?.skips?.F),
+    },
+    awaiting_context_files: Boolean(normalized.awaiting_context_files),
+    pending_context_files: Array.isArray(normalized.pending_context_files) ? normalized.pending_context_files : [],
+    imported_documents: {
+      cashflow_articles: normalized?.imported_documents?.cashflow_articles || '',
+      pl_articles: normalized?.imported_documents?.pl_articles || '',
+      business_process_raw: normalized?.imported_documents?.business_process_raw || '',
+    },
+    salary_payouts: {
+      period: normalized?.salary_payouts?.period || '',
+      structure: normalized?.salary_payouts?.structure || '',
+      bonuses: normalized?.salary_payouts?.bonuses || '',
+      contractors: normalized?.salary_payouts?.contractors || '',
+    },
+    owner_payouts: {
+      method: normalized?.owner_payouts?.method || '',
+      frequency: normalized?.owner_payouts?.frequency || '',
+      partners: normalized?.owner_payouts?.partners || '',
+      market_owner_salary: normalized?.owner_payouts?.market_owner_salary || '',
+    },
+    prepayments: {
+      from_clients: normalized?.prepayments?.from_clients || '',
+      to_contractors: normalized?.prepayments?.to_contractors || '',
+      average_gap_days: normalized?.prepayments?.average_gap_days || '',
+    },
+    projects: {
+      project_pl_required: normalized?.projects?.project_pl_required || '',
+      active_directions_count: normalized?.projects?.active_directions_count || '',
+      shared_cost_method: normalized?.projects?.shared_cost_method || '',
+    },
+    inventory: {
+      has_inventory: normalized?.inventory?.has_inventory || '',
+      procurement_model: normalized?.inventory?.procurement_model || '',
+      average_storage_days: normalized?.inventory?.average_storage_days || '',
+    },
+    loans: {
+      has_liabilities: normalized?.loans?.has_liabilities || '',
+      monthly_payment: normalized?.loans?.monthly_payment || '',
+      interest_rate: normalized?.loans?.interest_rate || '',
+      investors_terms: normalized?.loans?.investors_terms || '',
+    },
+    one_off_expenses: {
+      has_assets: normalized?.one_off_expenses?.has_assets || '',
+      assets_list: normalized?.one_off_expenses?.assets_list || '',
+      planned_big_expenses: normalized?.one_off_expenses?.planned_big_expenses || '',
+    },
+    recommended_pl_method: normalized.recommended_pl_method || '',
+    last_diagnosis_at: normalized.last_diagnosis_at || '',
+    history: Array.isArray(normalized.history) ? normalized.history : [],
+  }
+}
+
+function hasFinancialMechanicsContext(session, financialSession) {
+  const hasProcess = hasCompletedProcessModel(session.process_model)
+  const cashflow = normalizeCashflowSession(session.cashflow_session)
+  const hasCashflowItems = cashflow.items_count > 0
+  const hasImportedPL = Boolean(financialSession?.imported_documents?.pl_articles || financialSession?.imported_documents?.cashflow_articles)
+  return hasProcess && (hasCashflowItems || hasImportedPL)
+}
+
+function buildFinancialMechanicsContextRequestMessage() {
+  return `Привіт! Схоже це перший раз коли ти звертаєшся до мене з цього акаунту.
+
+Щоб пройти діагностику фінансової механіки —
+мені потрібні файли з попередніх уроків:
+
+📎 cashflow_articles.md — зі статтями Cashflow і P&L (урок 2.1)
+📎 business_process.json — зі схемою бізнес-процесу (урок 1.2)
+
+Прикріпи їх і я одразу почну.
+
+Або якщо ти ще не проходив попередні уроки —
+почни з початку курсу за посиланням:
+https://t.me/fineko_processes_bot?start=main_process`
+}
+
+function buildFinancialMechanicsStartMessage(processModel) {
+  const businessType = processModel?.business_type || 'не вказано'
+  return `Починаємо діагностику фінансової механіки.
+
+Я вже підтягнув контекст вашого бізнесу (${businessType}) з попередніх блоків, тому не будемо дублювати базові питання.
+
+Блок А. Як зараз виплачується зарплата команді?`
+}
+
+function buildPlArticlesContext(session, financialSession) {
+  const cashflow = normalizeCashflowSession(session.cashflow_session)
+  const collected = {
+    cashflow_items: cashflow.items,
+    imported_cashflow_articles: financialSession?.imported_documents?.cashflow_articles || '',
+    imported_pl_articles: financialSession?.imported_documents?.pl_articles || '',
+  }
+  return JSON.stringify(collected, null, 2)
+}
+
+function buildFinancialMechanicsFallbackQuestion(financialSession) {
+  const completed = new Set(financialSession.completed_blocks || [])
+  if (!completed.has('A')) return 'Як виплачується зарплата команді: раз на місяць, двічі на місяць чи по-різному?'
+  if (!completed.has('B')) return 'Як власник бере гроші з бізнесу: зарплата, дивіденди чи змішано?'
+  if (!completed.has('C')) return 'Чи берете передоплати від клієнтів і чи платите аванси підрядникам?'
+  if (!completed.has('D')) return 'Чи є окремі проєкти/напрямки, де важливо бачити прибутковість окремо?'
+  if (!completed.has('E') && !financialSession.skips.E) return 'Чи є склад або закупка матеріалів наперед?'
+  if (!completed.has('F') && !financialSession.skips.F) return 'Чи є кредити, позики, лізинг або інвестори з виплатами?'
+  if (!completed.has('G')) return 'Чи є велике обладнання або планові разові витрати на найближчий рік?'
+  return 'Перевірте, будь ласка, чи все коректно зафіксовано, і підтвердьте фінальний підсумок.'
+}
+
+function getMissingFinancialMechanicsSections(financialSession) {
+  const missing = []
+  if (!isAnyValueFilled(financialSession.salary_payouts)) {
+    missing.push('Зарплата і виплати')
+  }
+  if (!isAnyValueFilled(financialSession.owner_payouts)) {
+    missing.push('Власник')
+  }
+  if (!String(financialSession.recommended_pl_method || '').trim()) {
+    missing.push('Рекомендований метод P&L')
+  }
+  return missing
+}
+
+function isAnyValueFilled(obj) {
+  if (!obj || typeof obj !== 'object') return false
+  return Object.values(obj).some((value) => String(value || '').trim().length > 0)
+}
+
+function buildFinancialMechanicsDocument(session, financialSession) {
+  const businessName = session.process_model?.business_type || 'не вказано'
+  const dateStr = new Date().toISOString().slice(0, 10)
+  const lines = [
+    '# Фінансова механіка бізнесу',
+    `**Бізнес:** ${businessName}`,
+    `**Дата:** ${dateStr}`,
+    '',
+    '## Зарплата і виплати',
+    `- Periodичність: ${financialSession.salary_payouts.period || 'не вказано'}`,
+    `- Структура: ${financialSession.salary_payouts.structure || 'не вказано'}`,
+    `- Бонуси: ${financialSession.salary_payouts.bonuses || 'не вказано'}`,
+    `- Підрядники: ${financialSession.salary_payouts.contractors || 'не вказано'}`,
+    '',
+    '## Власник',
+    `- Спосіб виплати: ${financialSession.owner_payouts.method || 'не вказано'}`,
+    `- Periodичність: ${financialSession.owner_payouts.frequency || 'не вказано'}`,
+    `- Ринкова вартість роботи власника: ${financialSession.owner_payouts.market_owner_salary || 'не визначено'}`,
+    '',
+    '## Аванси і передоплати',
+    `- Від клієнтів: ${financialSession.prepayments.from_clients || 'не вказано'}`,
+    `- Підрядникам: ${financialSession.prepayments.to_contractors || 'не вказано'}`,
+    `- Середній термін між авансом і виконанням: ${financialSession.prepayments.average_gap_days || 'не вказано'}`,
+    '',
+    '## Проекти і напрямки',
+    `- P&L по проектах потрібен: ${financialSession.projects.project_pl_required || 'не вказано'}`,
+    `- Кількість активних напрямків: ${financialSession.projects.active_directions_count || 'не вказано'}`,
+    `- Розподіл спільних витрат: ${financialSession.projects.shared_cost_method || 'не вказано'}`,
+    '',
+    '## Склад і закупки',
+    `- Є склад: ${financialSession.inventory.has_inventory || 'не вказано'}`,
+    `- Модель закупки: ${financialSession.inventory.procurement_model || 'не вказано'}`,
+    `- Середній термін зберігання: ${financialSession.inventory.average_storage_days || 'не вказано'}`,
+    '',
+    '## Кредити і відсотки',
+    `- Є зобов'язання: ${financialSession.loans.has_liabilities || 'не вказано'}`,
+    `- Щомісячні виплати: ${financialSession.loans.monthly_payment || 'не вказано'}`,
+    `- Відсоткова ставка: ${financialSession.loans.interest_rate || 'не вказано'}`,
+    '',
+    '## Амортизація',
+    `- Є активи для амортизації: ${financialSession.one_off_expenses.has_assets || 'не вказано'}`,
+    `- Активи: ${financialSession.one_off_expenses.assets_list || 'не вказано'}`,
+    '',
+    '## Рекомендований метод P&L',
+    financialSession.recommended_pl_method || 'Рекомендації потребують уточнення.',
+  ]
+
+  return lines.join('\n')
 }
 
 function normalizeCashflowSession(cashflowSession) {
@@ -619,6 +918,14 @@ bot.onText(/\/status/, async (msg) => {
       return
     }
 
+    if (session.current_scenario === SCENARIO_FINANCIAL_MECHANICS) {
+      const financialSession = normalizeFinancialMechanicsSession(session.financial_mechanics_session)
+      await safeSendMessage(userId,
+        `📋 Статус вашої сесії:\n• Режим: діагностика фінансової механіки\n• Статус: ${status}\n• Поточний блок: ${financialSession.current_block}\n• Завершено блоків: ${financialSession.completed_blocks.length}`
+      )
+      return
+    }
+
     const lanes = session.process_model?.lanes?.length || 0
     const nodes = (session.process_model?.lanes || []).reduce((s, l) => s + (l.nodes?.length || 0), 0)
     await safeSendMessage(userId,
@@ -641,6 +948,11 @@ bot.on('message', async (msg) => {
   if (!text) return
 
   try {
+    const session = await db.getOrCreateSession(userId)
+    if (isFinancialMechanicsTrigger(text) && session.current_scenario !== SCENARIO_FINANCIAL_MECHANICS) {
+      await launchScenario(userId, SCENARIO_FINANCIAL_MECHANICS)
+      return
+    }
     await handleMessage(userId, text)
   } catch (err) {
     console.error(`[bot] Unhandled message error user=${userId}:`, err.message)
@@ -660,7 +972,29 @@ bot.on('callback_query', async (query) => {
       await bot.answerCallbackQuery(query.id, { text: '🔄 Прискорінюючи...' })
       const session = await db.getOrCreateSession(userId)
       await launchScenario(userId, session.current_scenario || SCENARIO_MAIN)
-    } else if (action === 'action_download' || action === 'action_download_process' || action === 'action_download_cashflow') {
+    } else if (action === 'action_financial_update') {
+      await bot.answerCallbackQuery(query.id, { text: 'Оновлюємо діагностику...' })
+      const session = await db.getOrCreateSession(userId)
+      const nextSession = await db.resetSessionForScenario(userId, SCENARIO_FINANCIAL_MECHANICS)
+      const financialSession = normalizeFinancialMechanicsSession(nextSession.financial_mechanics_session)
+      financialSession.awaiting_context_files = !hasFinancialMechanicsContext(session, financialSession)
+      nextSession.financial_mechanics_session = financialSession
+      await db.saveSession(nextSession)
+
+      if (financialSession.awaiting_context_files) {
+        await safeSendMessage(userId, buildFinancialMechanicsContextRequestMessage())
+      } else {
+        await safeSendMessage(userId, buildFinancialMechanicsStartMessage(session.process_model))
+      }
+    } else if (action === 'action_financial_view') {
+      const session = await db.getOrCreateSession(userId)
+      if (session.financial_mechanics_model?.status === 'complete' && session.financial_mechanics_model?.markdown) {
+        await bot.answerCallbackQuery(query.id, { text: 'Відправляю поточний файл...' })
+        await sendFinancialMechanicsFile(userId, session)
+      } else {
+        await bot.answerCallbackQuery(query.id, { text: 'Файл ще не зібрано', show_alert: true })
+      }
+    } else if (action === 'action_download' || action === 'action_download_process' || action === 'action_download_cashflow' || action === 'action_download_financial') {
       console.log(`[bot] User ${userId}: Clicked download button`)
       const session = await db.getOrCreateSession(userId)
       if (action === 'action_download_cashflow') {
@@ -677,6 +1011,13 @@ bot.on('callback_query', async (query) => {
           await sendProcessFiles(userId, session)
         } else {
           await bot.answerCallbackQuery(query.id, { text: '❌ Схема ще не готова', show_alert: true })
+        }
+      } else if (action === 'action_download_financial') {
+        if (session.financial_mechanics_model?.status === 'complete' && session.financial_mechanics_model?.markdown) {
+          await bot.answerCallbackQuery(query.id, { text: '📑 Готово...' })
+          await sendFinancialMechanicsFile(userId, session)
+        } else {
+          await bot.answerCallbackQuery(query.id, { text: '❌ Діагностика ще не завершена', show_alert: true })
         }
       } else if (session.current_scenario === SCENARIO_CASHFLOW && session.cashflow_session?.items_count > 0) {
         await bot.answerCallbackQuery(query.id, { text: '📑 Готово...' })
@@ -727,6 +1068,7 @@ bot.on('document', async (msg) => {
   const userId = msg.chat.id
   const fileName = msg.document?.file_name || 'невизначений файл'
   const mimeType = msg.document?.mime_type || ''
+  const caption = msg.caption || ''
   console.log(`[bot] User ${userId}: Received document: ${fileName}`)
 
   try {
@@ -740,6 +1082,11 @@ bot.on('document', async (msg) => {
     await safeSendMessage(userId, '📄 Читаю документ...')
     const fileBuffer = await downloadTelegramFile(fileId)
     console.log(`[bot] User ${userId}: Document meta: mime=${mimeType || 'n/a'}, size=${fileBuffer.length}`)
+
+    const importedFinancialContext = await tryImportFinancialMechanicsContextDocument(userId, fileBuffer, fileName, mimeType, caption)
+    if (importedFinancialContext) {
+      return
+    }
 
     const importedProcessModel = await tryImportProcessModelFromDocument(userId, fileBuffer, fileName, mimeType)
     if (importedProcessModel) {
@@ -809,11 +1156,22 @@ async function sendChatAction(userId, action = 'typing') {
 
 async function sendCompletionActions(userId, scenario = SCENARIO_MAIN) {
   const isCashflow = scenario === SCENARIO_CASHFLOW
+  const isFinancial = scenario === SCENARIO_FINANCIAL_MECHANICS
   const text = isCashflow
     ? 'Готово. Блок зі статтями завершено, можете забрати ваш пакет документів:'
-    : `${MAIN_COMPLETION_MESSAGE}\n\nОберіть дію нижче:`
-  const downloadLabel = isCashflow ? 'Забрати мої документи' : 'Отримати опис процесу'
-  const downloadAction = isCashflow ? 'action_download_cashflow' : 'action_download_process'
+    : isFinancial
+      ? 'Готово. Діагностика фінансової механіки завершена, можете забрати файл:'
+      : `${MAIN_COMPLETION_MESSAGE}\n\nОберіть дію нижче:`
+  const downloadLabel = isCashflow
+    ? 'Забрати мої документи'
+    : isFinancial
+      ? 'Отримати financial_mechanics.md'
+      : 'Отримати опис процесу'
+  const downloadAction = isCashflow
+    ? 'action_download_cashflow'
+    : isFinancial
+      ? 'action_download_financial'
+      : 'action_download_process'
   try {
     await bot.sendMessage(userId, text, {
       parse_mode: 'Markdown',
@@ -899,6 +1257,23 @@ async function sendCashflowFiles(userId, session) {
   )
 
   await sendInstructionDocs(userId)
+}
+
+async function sendFinancialMechanicsFile(userId, session) {
+  const markdown = session.financial_mechanics_model?.markdown || ''
+  if (!markdown.trim()) {
+    await safeSendMessage(userId, 'Файл financial_mechanics.md ще не зібрано.')
+    return
+  }
+
+  const docBuffer = Buffer.from(markdown, 'utf8')
+  await sendChatAction(userId, 'upload_document')
+  await bot.sendDocument(
+    userId,
+    docBuffer,
+    { caption: 'Файл: financial_mechanics.md' },
+    { filename: 'financial_mechanics.md', contentType: 'text/markdown' }
+  )
 }
 
 async function sendInstructionDocs(userId) {
@@ -1039,7 +1414,15 @@ function splitMessageChunks(text, maxLen = 3500) {
 }
 
 function normalizeScenario(payload) {
-  return payload === SCENARIO_CASHFLOW ? SCENARIO_CASHFLOW : SCENARIO_MAIN
+  const value = String(payload || '').trim().toLowerCase()
+  if (value === SCENARIO_CASHFLOW) return SCENARIO_CASHFLOW
+  if (value === SCENARIO_FINANCIAL_MECHANICS || value === 'lesson_3_3_diagnosis') return SCENARIO_FINANCIAL_MECHANICS
+  return SCENARIO_MAIN
+}
+
+function isFinancialMechanicsTrigger(text) {
+  const normalized = String(text || '').toLowerCase()
+  return /(діагностик|механік|як рахувати p&l|зарплат|дивіденд|аванс|проєкт|проект)/.test(normalized)
 }
 
 function buildCashflowStartMessage(processModel) {
@@ -1101,6 +1484,47 @@ async function launchScenario(userId, payload) {
     return
   }
 
+  if (requestedScenario === SCENARIO_FINANCIAL_MECHANICS) {
+    const financialSession = normalizeFinancialMechanicsSession(session.financial_mechanics_session)
+    const alreadyBuilt = session.financial_mechanics_model?.status === 'complete' && session.financial_mechanics_model?.markdown
+
+    if (alreadyBuilt) {
+      const lastDate = session.financial_mechanics_model?.diagnosis_date
+        ? new Date(session.financial_mechanics_model.diagnosis_date).toISOString().slice(0, 10)
+        : 'невідома дата'
+
+      await bot.sendMessage(userId, `У мене вже є діагностика фінансової механіки твого бізнесу від ${lastDate}.
+
+Хочеш оновити її чи переглянути поточну?`, {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: 'Оновити', callback_data: 'action_financial_update' },
+              { text: 'Переглянути поточну', callback_data: 'action_financial_view' },
+            ],
+          ],
+        },
+      })
+      return
+    }
+
+    const nextSession = await db.resetSessionForScenario(userId, SCENARIO_FINANCIAL_MECHANICS)
+    const nextFinancialSession = normalizeFinancialMechanicsSession(nextSession.financial_mechanics_session)
+    const hasContext = hasFinancialMechanicsContext(session, nextFinancialSession)
+    nextFinancialSession.awaiting_context_files = !hasContext
+    nextSession.financial_mechanics_session = nextFinancialSession
+    nextSession.current_scenario = SCENARIO_FINANCIAL_MECHANICS
+    await db.saveSession(nextSession)
+
+    if (!hasContext) {
+      await safeSendMessage(userId, buildFinancialMechanicsContextRequestMessage())
+      return
+    }
+
+    await safeSendMessage(userId, buildFinancialMechanicsStartMessage(session.process_model))
+    return
+  }
+
   await db.resetSessionForScenario(userId, SCENARIO_MAIN)
   await safeSendMessage(userId, MAIN_START_MESSAGE)
 }
@@ -1157,6 +1581,72 @@ async function extractTextFromDocument(fileBuffer, fileName = '', mimeType = '')
   }
 
   return ''
+}
+
+async function tryImportFinancialMechanicsContextDocument(userId, fileBuffer, fileName, mimeType, caption = '') {
+  const session = await db.getOrCreateSession(userId)
+  const financialSession = normalizeFinancialMechanicsSession(session.financial_mechanics_session)
+  const lowerName = String(fileName || '').toLowerCase()
+  const diagnosisRequested = isFinancialMechanicsTrigger(caption)
+  const inFinancialFlow = session.current_scenario === SCENARIO_FINANCIAL_MECHANICS || financialSession.awaiting_context_files || diagnosisRequested
+
+  if (!inFinancialFlow) {
+    return false
+  }
+
+  let changed = false
+
+  if (/(business_process|process_model).*\.json$/i.test(lowerName) || lowerName === 'business_process.json') {
+    const text = decodeTextBuffer(fileBuffer).trim()
+    if (text) {
+      try {
+        const parsed = JSON.parse(text)
+        const model = (parsed && typeof parsed === 'object' && parsed.process_model) ? parsed.process_model : parsed
+        if (isProcessModelShape(model)) {
+          session.process_model = { ...model, status: 'complete' }
+          financialSession.imported_documents.business_process_raw = text.slice(0, 20000)
+          changed = true
+          await safeSendMessage(userId, '✅ business_process.json отримано і збережено.')
+        }
+      } catch {
+        // ignore invalid JSON and continue with regular flow
+      }
+    }
+  }
+
+  const isArticlesFile = /(pl[_\- ]?articles|cashflow[_\- ]?articles)/i.test(lowerName) || lowerName.endsWith('.md') || lowerName.endsWith('.txt')
+  if (isArticlesFile) {
+    const extractedText = await extractTextFromDocument(fileBuffer, fileName, mimeType)
+    if (String(extractedText || '').trim()) {
+      if (/pl[_\- ]?articles/i.test(lowerName)) {
+        financialSession.imported_documents.pl_articles = extractedText.slice(0, 50000)
+        changed = true
+        await safeSendMessage(userId, '✅ pl_articles отримано і збережено.')
+      } else if (/cashflow[_\- ]?articles/i.test(lowerName) || diagnosisRequested) {
+        financialSession.imported_documents.cashflow_articles = extractedText.slice(0, 50000)
+        changed = true
+        await safeSendMessage(userId, '✅ cashflow_articles отримано і збережено.')
+      }
+    }
+  }
+
+  if (!changed) {
+    return false
+  }
+
+  session.current_scenario = SCENARIO_FINANCIAL_MECHANICS
+  session.financial_mechanics_session = financialSession
+  financialSession.awaiting_context_files = !hasFinancialMechanicsContext(session, financialSession)
+  session.status = 'draft'
+  await db.saveSession(session)
+
+  if (financialSession.awaiting_context_files) {
+    await safeSendMessage(userId, 'Ще потрібні обидва файли: cashflow_articles.md і business_process.json. Коли отримаю їх, одразу стартуємо діагностику.')
+  } else {
+    await safeSendMessage(userId, buildFinancialMechanicsStartMessage(session.process_model))
+  }
+
+  return true
 }
 
 async function tryImportProcessModelFromDocument(userId, fileBuffer, fileName, mimeType) {

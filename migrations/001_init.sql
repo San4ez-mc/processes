@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS current_scenario VARCHAR(50) NOT NULL DEFAULT 'main_process';
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cashflow_session JSONB;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS financial_reports_model JSONB;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS financial_mechanics_session JSONB;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS financial_mechanics_model JSONB;
 
 CREATE INDEX IF NOT EXISTS idx_sessions_telegram_id ON sessions(telegram_id);
 
