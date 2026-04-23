@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/bot.js",
     "dev": "nodemon src/bot.js",
-    "migrate": "node -e \"require('./src/db').runMigration()\""
+    "migrate": "node -e \"require('./src/db').runMigration()\"",
+    "test": "node --test"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
